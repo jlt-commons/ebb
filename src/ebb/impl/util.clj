@@ -1,9 +1,47 @@
 (ns ^:no-doc ebb.impl.util
   "Shared primitives: the Cancelled signal and the host timer seam."
   (:require [jolt.scheme :as scheme]
+            [jolt.fibers :as fib]
             [clojure.core.async :as a]))
 
 (defn nop [])
+
+;; ------------------------------------------------------------ context-local
+;;
+;; Missionary's Java impls keep some state in a ThreadLocal -- Reactor's
+;; `current` and `delayed` are the ones that matter. The .cljs impls use a plain
+;; global, which is the same thing when there is one thread. Ebb ported the
+;; global, and on a multi-carrier runtime that means one fiber's reactor context
+;; is visible to every other fiber.
+;;
+;; jolt has no ThreadLocal constructor, and the carrier thread is the WRONG
+;; granularity anyway: a fiber can park in the middle of a propagation and let
+;; another fiber run on the same carrier, so two propagations would share an
+;; entry. The right unit is the fiber, falling back to the thread off-fiber.
+;; Returning the fiber (or thread) object itself, rather than a [thread fiber]
+;; pair, keeps a read allocation-free.
+
+(defn context-key
+  "Identity of the current execution context: the fiber, or the thread when not
+  on one. Distinct for any two things that can run concurrently."
+  []
+  (or (fib/current-fiber) (Thread/currentThread)))
+
+(defn context-local
+  "A place whose value is private to the context that set it -- ebb's
+  ThreadLocal. Read with `local-get`, write with `local-set!`."
+  []
+  (atom {}))
+
+(defn local-get [reg] (get @reg (context-key)))
+
+(defn local-set!
+  "Set this context's value, or drop the entry when v is nil so contexts that
+  come and go do not accumulate."
+  [reg v]
+  (let [k (context-key)]
+    (if (nil? v) (swap! reg dissoc k) (swap! reg assoc k v)))
+  v)
 
 ;; ---------------------------------------------------- batched process starts
 ;;
