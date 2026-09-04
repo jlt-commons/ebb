@@ -183,6 +183,32 @@ CAS (`deftype` equality is identity); process leakage between tests; and the
 
 Neither budget has been widened.
 
+## Checked against missionary's issue tracker
+
+`test/ebb/missionary-issues-test` runs the repros from missionary's issues, so
+a behaviour that is right today stays right. Three kinds:
+
+**Regressions — closed upstream, ebb has the fix.** `#74` zip terminating on
+the shorter input; `#126` `latest` with zero inputs; `#125` `signal` reporting
+an uninitialised flow instead of leaking; `#115` a sleep spawned from another
+sleep's termination callback not running user code on an interrupted thread.
+
+**Open upstream, and ebb does not have the bug.** `#116` — cancelling an `ap`
+propagates into every child branch, which missionary does not do. `#85` —
+posting to a mailbox returns nil, as documented. `#108` — `(m/?> ##Inf …)` over
+many tasks is correct and roughly linear at 400; the reported knee is higher,
+and `ebb-8nq.25` tracks finding it.
+
+**Open design questions, where matching missionary is the answer.** `#111` —
+`(m/sem 0)` and `(m/sem -1)` construct, and acquiring blocks. `#82` —
+cancelling a `via` whose body catches `Throwable` still *succeeds*, with
+whatever the handler returned; that is correct, because cancellation is
+cooperative and a body that swallows the interrupt has not been cancelled.
+
+Two are still open against ebb itself: `ebb-8nq.26` (`#81`'s first expression
+hangs, though ebb is immune to the scheduler poisoning the issue is about — the
+timer survives) and `ebb-8nq.27` (`#86`'s event trace).
+
 ## Tests not ported, and why
 
 | Namespace | Why |
