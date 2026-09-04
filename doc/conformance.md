@@ -91,10 +91,19 @@ enqueues on the owner rather than resuming inline. `sp` does not.
 ## Host differences inherited from jolt
 
 <!-- divergence: deftype-field-shadowing -->
-- **A local may not share a name with a mutable `deftype` field.** In some
-  shapes such a local reads the FIELD rather than the binding, so a snapshot
-  taken before a `set!` comes back holding the value that `set!` wrote. The
-  classic missionary idiom
+- **A local may not share a name with a mutable `deftype` field** — a convention,
+  no longer a known defect. It was recorded as one: four sites in `impl/` were
+  fixed by renaming such locals to a `v-` prefix, and the symptom was a snapshot
+  taken before a `set!` coming back holding the value `set!` wrote. On jolt
+  v0.8.1 it **does not reproduce** — not at either site where it was confirmed
+  (renaming back leaves the suite green), and not in eleven constructed shapes,
+  including inside a `deftype` method, where field names really are implicitly
+  bound. Either jolt fixed it, or the original diagnosis was confounded: both
+  renames landed in the same commit as structural changes, and the symptom is
+  indistinguishable from a lost read-modify-write under concurrency — the defect
+  class `ebb-8nq.31`/`.32`/`.35` kept finding. The convention stays because it
+  costs nothing; `ebb-8nq.24` carries the evidence, and says to rule out
+  concurrency first if it ever comes back.
 
   ```clojure
   (let [pending (.-pending ps)]     ; snapshot

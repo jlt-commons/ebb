@@ -68,8 +68,8 @@
 
  {:id       :deftype-field-shadowing
   :kind     :host
-  :summary  "a local may not share a name with a mutable deftype field: in some shapes the local reads the FIELD. ebb's convention is to prefix such locals v-."
-  :unpinned "A jolt compiler defect (ebb-8nq.24), not an ebb behaviour. Not yet minimised, so there is nothing stable to assert against."}
+  :summary  "ebb prefixes a local that would share a name with a mutable deftype field with v-. A convention, not a known defect: the jolt bug it was adopted for does not reproduce on v0.8.1, and may never have existed -- see ebb-8nq.24."
+  :unpinned "There is nothing to assert. Renaming the locals back leaves the suite green, so a test would pass either way; the convention is documentation of a hazard, and ebb-8nq.24 records why it is kept."}
 
  {:id       :strings-are-codepoint-indexed
   :kind     :host
