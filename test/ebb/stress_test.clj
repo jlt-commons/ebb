@@ -259,3 +259,41 @@
     (testing label
       (dotimes [_ rounds]
         (is (= [:ok expected] (settle (flow))))))))
+
+;; ------------------------------------------------------- combining operators
+
+(deftest zip-of-two-staggered-aps
+  ;; ebb-8nq.35. `pending` counts the inputs that still owe a notification, and
+  ;; whoever brings it to zero owns the round. It was a plain field, so two
+  ;; notifications landing at once lost a decrement and it never reached zero:
+  ;; the zip went idle with both inputs notified and nobody holding the round.
+  ;; 33 runs in 200 before the atom, and silent -- no throw, no stack.
+  ;;
+  ;; The stagger matters. Two inputs notifying at the SAME moment stalled 2 in
+  ;; 200; a millisecond apart, 33. The window is one notifier's read-modify-write
+  ;; straddling the other's, and arriving together mostly misses it.
+  (dotimes [_ 60]
+    (is (= [:ok [[1 2]]]
+           (settle (m/reduce conj [] (m/zip vector
+                                            (m/ap (m/? (m/sleep 2 1)))
+                                            (m/ap (m/? (m/sleep 1 2))))))))))
+
+(deftest latest-over-two-references-advanced-at-once
+  ;; the same defect in the same shape, in the other combining operator:
+  ;; Latest.java drives its `sync` word with compareAndSet and ebb had a plain
+  ;; read-then-set!, so two notifiers both found `idle` and both took ownership,
+  ;; or one overwrote the other's `siblings` link and that notification was
+  ;; never consumed. 15 runs in 40 before, and each stall cost the full deadline
+  ;; -- this test took 30s and now takes 76ms.
+  ;;
+  ;; `m/latest` needs CONTINUOUS inputs, which is why these are watches and not
+  ;; the aps above. Two references advanced from two threads put the two
+  ;; notifications on two executors, which is the window the CAS covers.
+  (dotimes [_ 40]
+    (let [a (atom 0) b (atom 0) target 60
+          out (promise)]
+      ((m/reduce (fn [_ x] (if (= x [target target]) (reduced x) x)) nil
+                 (m/latest vector (m/watch a) (m/watch b)))
+       (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
+      (in-parallel 2 (fn [i] (dotimes [_ target] (swap! (if (zero? i) a b) inc))))
+      (is (= [:ok [target target]] (deref out timeout-ms [:err ::timeout]))))))

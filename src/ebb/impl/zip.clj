@@ -1,6 +1,34 @@
-;; Derived from missionary/impl/Zip.cljs (missionary, EPL 2.0).
-;; Zip.java takes no lock: the pending counter serialises everything, and a
-;; transfer only runs when it reaches zero.
+;; Derived from missionary (EPL 2.0):
+;;   logic           <- missionary/impl/Zip.cljs
+;;   synchronisation <- missionary/impl/Zip.java  (a ReentrantLock on `pending`)
+;;
+;; ADR-001 rule 1. `pending` counts how many inputs still owe a notification
+;; before the zip can transfer: `run` sets it to the arity, every notification
+;; decrements, and whoever brings it to ZERO owns the round. Zip.java holds a
+;; ReentrantLock across every one of those updates and across both deref loops.
+;;
+;; The header this file used to carry said Zip.java takes no lock and that the
+;; counter serialises everything by itself. It was wrong on both counts, and
+;; that is why the file was not on ebb-8nq.32's list -- that audit went looking
+;; for a `busy` field and this one counts. `(set! (.-pending ps) (dec (.-pending
+;; ps)))` is a read and a write, so two inputs notifying at once lose a
+;; decrement, `pending` never reaches zero, nobody is ever handed the round, and
+;; the zip goes idle with both inputs notified. Measured at 33 runs in 200 of
+;;
+;;   (m/zip vector (m/ap (m/? (m/sleep 2 1))) (m/ap (m/? (m/sleep 1 2))))
+;;
+;; and 0 in 200 when both inputs are seeds, which is the tell: it takes two
+;; inputs whose notifications come from different executors.
+;;
+;; The lock itself is not portable -- both loops deref an input, and for an ap
+;; or cp input that parks, which is what ADR-001 rule 5 forbids. An atomic
+;; counter is, and it is faithful. Addition commutes, so the order the updates
+;; land in cannot change the total; and the intermediate values cannot hand the
+;; round to two owners either, because inside a deref loop `pending` only ever
+;; DECREASES -- a deref can make its own input notify again, and nothing adds
+;; until the loop is over -- so it cannot pass through zero a second time. That
+;; is the same argument Eduction.java's atomic PRESSURE counter runs on, and
+;; ebb.impl.eduction ports that one directly.
 (ns ^:no-doc ebb.impl.zip)
 
 (declare cancel transfer ready)
@@ -9,7 +37,7 @@
                   ^:unsynchronized-mutable step
                   done
                   inputs
-                  ^:unsynchronized-mutable pending]
+                  pending]
   clojure.lang.IFn
   (invoke [z] (cancel z))
   clojure.lang.IDeref
@@ -27,7 +55,7 @@
               (recur (inc i) c)
               (do (try @input (catch Throwable _ nil))
                   (recur (inc i) (inc c)))))
-          (let [p (set! (.-pending ps) (+ (.-pending ps) c))]
+          (let [p (swap! (.-pending ps) + c)]
             (if (zero? c) ((.-done ps)) (when (zero? p) (ready ps)))))))))
 
 (defn- cancel [^Process ps]
@@ -50,27 +78,27 @@
            (set! (.-step ps) nil)
            (throw e))
          (finally
-           (let [p (set! (.-pending ps) (+ (.-pending ps) @c))]
+           (let [p (swap! (.-pending ps) + @c)]
              (when (nil? (.-step ps)) (cancel ps))
              (when (zero? p) (ready ps)))))))
 
 (defn run [f fs s d]
   (let [arity  (count fs)
         inputs (object-array arity)
-        ps     (->Process f s d inputs 0)]
+        ps     (->Process f s d inputs (atom 0))]
     (loop [i 0 fs (seq fs)]
       (when fs
         (let [input ((first fs)
-                     (fn [] (let [p (set! (.-pending ps) (dec (.-pending ps)))]
+                     (fn [] (let [p (swap! (.-pending ps) dec)]
                               (when (zero? p) (ready ps))))
                      (fn [] (aset (.-inputs ps) i ps)
                        (set! (.-step ps) nil)
-                       (let [p (set! (.-pending ps) (dec (.-pending ps)))]
+                       (let [p (swap! (.-pending ps) dec)]
                          (when-not (neg? p) (cancel ps))
                          (when (zero? p) (ready ps)))))]
           (when (nil? (aget inputs i)) (aset inputs i input)))
         (recur (inc i) (next fs))))
-    (let [p (set! (.-pending ps) (+ (.-pending ps) arity))]
+    (let [p (swap! (.-pending ps) + arity)]
       (when (nil? (.-step ps)) (cancel ps))
       (when (zero? p) (ready ps))
       ps)))
