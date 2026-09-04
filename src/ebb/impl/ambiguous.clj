@@ -45,7 +45,10 @@
                   ^:unsynchronized-mutable choices
                   ^:unsynchronized-mutable branches
                   ^:unsynchronized-mutable parks
-                  ^:unsynchronized-mutable ended]
+                  ^:unsynchronized-mutable ended
+                  ;; an error has been handed downstream, so nothing more will
+                  ;; be. Results still to come are drained and dropped.
+                  ^:unsynchronized-mutable failed]
   clojure.lang.IFn
   (invoke [this] (cast! this #(cancel this)) nil)
   clojure.lang.IDeref
@@ -75,7 +78,13 @@
 
 (defn- produced! [^Process ps owner tag v]
   (set! (.-branches ps) (dec (.-branches ps)))
-  (set! (.-queue ps) (conj (.-queue ps) [tag v owner]))
+  (if (.-failed ps)
+    ;; the ap has already failed: drop the result, but release the slot exactly
+    ;; as a transfer would, or the choice is never reaped and the process never
+    ;; terminates
+    (when-some [^Choice ch owner]
+      (set! (.-flight ch) (dec (.-flight ch))))
+    (set! (.-queue ps) (conj (.-queue ps) [tag v owner])))
   nil)
 
 (defn- watch-park!
@@ -250,6 +259,11 @@
   (cond
     (.-ended ps) nil
     (.-notified ps) nil
+    (.-failed ps) (when (finished? ps)
+                    (set! (.-ended ps) true)
+                    (call! ps deregister!)
+                    (server/retire! (.-owner ps))
+                    ((.-terminator ps)))
     (seq (.-queue ps)) (do (set! (.-notified ps) true) ((.-notifier ps)))
     (finished? ps) (do (set! (.-ended ps) true)
                        (call! ps deregister!)
@@ -265,8 +279,35 @@
     (set! (.-queue ps) (subvec (.-queue ps) 1))
     (when-some [^Choice ch owner]
       (set! (.-flight ch) (dec (.-flight ch))))
-    (pump! ps)
-    (if (= ::ok tag) v (throw v))))
+    (if (= ::ok tag)
+      (do (pump! ps) v)
+      ;; ebb-8nq.38. Handing an error downstream ends the ap's output: the
+      ;; branches still in flight are DISCARDED rather than delivered after the
+      ;; failure. Ambiguous.java does it by nilling its notifier and dropping
+      ;; head/tail in the same breath as returning the error.
+      ;;
+      ;; It does NOT force termination, which is the part that is easy to get
+      ;; wrong and that missionary's own `?>-cancel-with-crash` catches. An ap
+      ;; whose input has not terminated is not over just because it failed:
+      ;; `(ap (?> crash-flow))` hands the error out and then simply waits, on
+      ;; both sides. So this settles as usual and the terminator fires only
+      ;; once nothing is left -- which for the cases that DO end is still
+      ;; inside this transfer, ahead of the throw, exactly where missionary
+      ;; puts it.
+      (do (set! (.-failed ps) true)
+          ;; release the slots of the results we are dropping, or their choices
+          ;; are never reaped
+          (let [q (.-queue ps)
+                n (count q)]
+            (set! (.-queue ps) [])
+            (loop [i 0]
+              (when (< i n)
+                (when-some [^Choice ch (nth (nth q i) 2)]
+                  (set! (.-flight ch) (dec (.-flight ch))))
+                (recur (inc i)))))
+          (cancel ps)
+          (pump! ps)
+          (throw v)))))
 
 (defn- cancel [^Process ps]
   (when (.-live ps)
@@ -335,7 +376,7 @@
 
 (defn run [body n t]
   (let [pr (p/prompt)
-        ps (->Process n t pr (server/spawn) true [] false [] 1 [] false)]
+        ps (->Process n t pr (server/spawn) true [] false [] 1 [] false false)]
     (call! ps (fn []
                 (register! pr)
                 (handle! ps nil (step! ps #(p/start pr body)))
