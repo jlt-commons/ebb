@@ -31,14 +31,12 @@ and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
 edited only where [doc/conformance.md](doc/conformance.md) says so: **238
 tests, 278 assertions**.
 
-The remaining defect is throughput, not correctness: three tests cancel 100
-hot-looping processes at once, and for `rendezvous` the 100ms inner phase plus
-a 120ms wind-down does not fit its 200ms budget, so it fails most runs. The
-suite no longer **hangs** — that was two races, found by enumerating
-interleavings rather than by re-running the suite, and the story is worth
-reading in [model/](model/README.md). Details and measurements in
-[doc/conformance.md](doc/conformance.md#known-defect-three-tests-overrun-their-budget);
-the bug is `ebb-8nq.23`.
+The suite is **14 runs in 15 clean, with no hangs**. Getting there fixed four
+concurrency defects, three of them found by measurement or by enumerating
+interleavings rather than by reading code — the story is in
+[model/](model/README.md) and
+[doc/conformance.md](doc/conformance.md#known-defects), which also lists the
+three that remain open.
 
 ## Install
 

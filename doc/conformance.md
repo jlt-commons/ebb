@@ -111,77 +111,29 @@ enqueues on the owner rather than resuming inline. `sp` does not.
   state, so left set it survives into the next namespace and kills the first
   blocking wait there.
 
-## Known defect: three tests overrun their budget
+## Known defects
 
-`ebb.core-test`'s `rendezvous` fails on roughly 4 runs in 5, and
-`reactor-delayed` occasionally. Everything else in the suite is stable, and the
-suite **no longer hangs**. Tracked as `ebb-8nq.23`.
+The suite is **14 runs in 15 clean, with no hangs**. What remains, and what was
+fixed, is worth stating precisely because most of it was found by measurement
+rather than by reading.
 
-### The hang is fixed, and how it was found is worth repeating
+### Fixed
 
-The suite used to hang outright — about 1 run in 7 on the default 4 carriers,
-and **6 times out of 6 on sixteen**. Hammering it located the namespace and
-little else, because more runs only ever sample more schedules.
-
-Two relational models under [`model/`](../model/README.md) enumerated *every*
-interleaving instead, and between them explained it end to end:
-
-- `ebb.impl.sleep` is the one task completed by two different threads — the
-  runtime timer fires it, whoever cancels the process cancels it. The port took
-  the `.cljs` logic, which arbitrates with a plain mutable flag because
-  ClojureScript has one thread. **12 of 20 interleavings complete it twice.**
-  This was an ADR-001 rule 1 violation: `.cljs` logic without `Sleep.java`'s
-  synchronisation, which arbitrates under the scheduler lock.
-- A doubly-completed task resumes its process twice. `ebb.impl.affine` kept the
-  driver's gate in a single cell, and `deliver` on a realized promise is a
-  no-op, so two resumers install two gates but produce one wake-up. **Every
-  schedule strands a resumer** on a gate nobody opens — and a stranded resumer
-  is a blocked carrier.
-
-`Sleep` now claims completion under a lock, and the gate is a drained queue
-rather than an overwritten cell. Hangs at 16 carriers went from 6/6 to **0 of
-15**.
-
-### What remains is arithmetic, not flakiness
-
-`semaphore`, `rendezvous` and `mailbox` each run 100 `sp` processes hot-looping
-on a port under an inner `(m/timeout ... 100)`, inside a task the harness fails
-at 200ms. Wind-down after the inner timeout fires:
-
-| Shape | Wind-down |
+| Defect | Cause |
 |---|---|
-| 100 hot processes, plain `sleep 0`, nothing compelled | 43-55 ms |
-| `holding` a 7-permit semaphore | 20-23 ms |
-| `compel` + mailbox | 76-87 ms |
-| `compel` + rendezvous | **120-124 ms** |
+| Suite hung ~1 run in 7, 6/6 at 16 carriers | `Sleep` completed twice — a non-atomic flag arbitrating the timer against the canceller — and two resumers then deadlocked on a single-cell gate. Found by enumerating interleavings ([model/](../model/README.md)), not by re-running. |
+| `rendezvous` overran its 200ms budget | `race-join` started children in series and each start blocked until the child's first park: ~100ms for 100 children, and the spawn loop was uninterruptible meanwhile. Starts are now batched. |
+| `reactor-delayed`, `reactor-double-sub` | Propagation had **no critical section**, so two fibers could propagate one process and one nilled `.-current` while the other read its ranks. Now a claim/trampoline: commit under the process monitor, propagate outside it. |
+| Silent hang under load | `ebb.impl.server` read `offer!` returning false as "retired" when it also means "full", and ran the thunk inline on the caller — resuming a continuation off its owner fiber. The mailbox is unbounded now. |
 
-100ms of inner phase plus 120ms of wind-down does not fit in 200ms. That is not
-a race; it is a throughput shortfall, and it is why `rendezvous` fails most
-runs. Per process the wind-down is ~1.2ms, against a 27us park — so the cost is
-in the handshake round trip, which is where to look next.
+### Open
 
-**The timeout rate went UP when the hang was fixed** (from ~2 runs in 15 to
-~12). The likely reason is that the deadlock was masking work: a stranded
-resumer meant a wind-down that never completed and so was never paid for.
-Recorded rather than smoothed over, because it is the kind of thing that looks
-like a regression and is not.
+- **`ap` with high parallelism intermittently stalls** (`ebb-8nq.31`). `(m/?> ##Inf …)` over 400 tasks takes 69ms standalone and occasionally exceeds 20s under suite load. Three orders of magnitude is a stall, not slowness. This is missionary's own `#108` shape.
+- **`ap`/`cp` notifiers block** (`ebb-8nq.29`), which both protocols forbid outright. Fixing it was implemented and measured: it fails 9 of missionary's own `ap_test`/`cp_test` cases, because lolcat is a synchronous DSL in which "the notification arrives a moment later" cannot be expressed. It needs lolcat adapted or replaced.
+- **The reactor context is global** (`ebb-8nq.30`), where the Java uses a `ThreadLocal`. Per-fiber was tried and is *wrong* for ebb: a reactor's `ap` runs on its own owner fiber, so a fiber-local context is invisible exactly where the subscription happens. The right unit is the reactor process.
 
-### Corrections to earlier conclusions here
-
-Four, kept because each sent the search the wrong way:
-
-- **"Cancelling 100 `sp` processes takes 1 ms"** measured *parked* processes.
-- **"The hangs came from concurrent background jobs."** They did not.
-- **"Scheduling jitter while tests share four carriers."** Refuted: more
-  carriers made the hang far worse, not better.
-- **"A data race we cannot localise."** It was two, and enumeration found both.
-
-Ruled out by measurement: primitive throughput; `compare-and-set!` cost (flat
-0.20us regardless of state size); `Event` identity under jolt's value-comparing
-CAS (`deftype` equality is identity); process leakage between tests; and the
-`ap`/`cp` prompt registries, which return to zero entries after every test.
-
-Neither budget has been widened.
+No test budget has been widened. A test far inside its budget that still trips
+is reporting something real.
 
 ## Checked against missionary's issue tracker
 
