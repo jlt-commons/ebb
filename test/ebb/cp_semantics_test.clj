@@ -69,3 +69,43 @@
         !inner (atom 1)]
     (is (= 11 (sample-once (m/cp (+ (m/?< (m/watch !outer))
                                     (m/?< (m/watch !inner)))))))))
+
+;; ---------------------------------------------- a continuous flow with no value
+
+(defn- settle [task]
+  (let [p (promise)]
+    (task (fn [v] (deliver p [:ok v])) (fn [e] (deliver p [:err (ex-message e)])))
+    (deref p 5000 [:err ::timeout])))
+
+(deftest latest-reports-an-input-that-has-no-value
+  ;; ebb-8nq.37. `m/latest` needs CONTINUOUS inputs -- ones that already have a
+  ;; value -- and must say so when given one that does not, the way `m/sample`
+  ;; reports "Undefined continuous flow". An `ap` is discrete, so every case
+  ;; here is a malformed program and every one must report rather than hang.
+  ;;
+  ;; It used to hang, and not just the process: a main thread waiting on a
+  ;; promise elsewhere never got its answer either, so `bin/test` had to be
+  ;; killed. The cause was one constructor argument. `Latest.java` leaves
+  ;; `ps.step` NULL until `arity == initialized`, and that null is what says
+  ;; "no value yet" -- `transfer` reports on it and `ready` drains instead of
+  ;; notifying. Ebb passed the step callback there instead, so the branch was
+  ;; unreachable and the malformed program went off into the sampling path.
+  ;;
+  ;; All three messages match missionary b.47 exactly.
+  (let [want [:err "Uninitialized continuous flow."]]
+    (testing "two discrete inputs"
+      (is (= want (settle (m/reduce conj [] (m/eduction (take 1)
+                            (m/latest vector (m/ap (m/? (m/sleep 2 1)))
+                                             (m/ap (m/? (m/sleep 1 2))))))))))
+    (testing "one discrete input"
+      (is (= want (settle (m/reduce conj [] (m/eduction (take 1)
+                            (m/latest vector (m/ap (m/? (m/sleep 2 1))))))))))
+    (testing "one discrete, one continuous"
+      (is (= want (settle (m/reduce conj [] (m/eduction (take 1)
+                            (m/latest vector (m/ap (m/? (m/sleep 2 1)))
+                                             (m/watch (atom :w))))))))))
+  ;; and the well-formed program still works
+  (testing "all inputs continuous"
+    (is (= [:ok [[:a :b]]]
+           (settle (m/reduce conj [] (m/eduction (take 1)
+                     (m/latest vector (m/watch (atom :a)) (m/watch (atom :b)))))))))) 

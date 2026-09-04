@@ -183,7 +183,13 @@
 (defn run [c fs s d]
   (let [it (.iterator (seq fs))
         arity (count fs)
-        ps (->Process s d c nil (atom (u/context-key))
+        ;; `step` starts NIL, as Latest.java's does. It is what says "this flow
+        ;; has no value yet": `transfer` reports Uninitialized on it, and
+        ;; `ready` drains rather than notifies. ebb passed `s` here instead, so
+        ;; the uninitialized branch was unreachable and a latest over a DISCRETE
+        ;; input -- which is exactly the program that cannot initialise -- went
+        ;; off into `ready`'s sampling path and wedged (ebb-8nq.37).
+        ps (->Process nil d c nil (atom (u/context-key))
              (object-array arity)
              (object-array arity)
              (object-array arity)
