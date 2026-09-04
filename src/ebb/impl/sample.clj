@@ -101,15 +101,25 @@
   (let [args  (.-args ps)
         input (aget (.-inputs ps) i)]
     (loop []
-      (if (locking ps (when (identical? (aget args i) args)
-                        (aset args i nil) true))
-        (let [x @input]
-          (if (locking ps (if (identical? (aget args i) args)
-                            true
-                            (do (aset args i x) false)))
-            (recur)
-            x))
-        (locking ps (aget args i))))))
+      ;; ONE region for both questions. Asking "is it dirty?" and reading the
+      ;; cached value in two regions leaves a window for a `dirty` in between,
+      ;; and the read then answers with the SENTINEL -- the args array itself --
+      ;; which goes straight into the combinator's arguments. Caught by
+      ;; stress_test's sample case, about one run in a hundred and only under
+      ;; load. The reply is wrapped so that a cached nil is still distinguishable
+      ;; from "you have the slot".
+      (let [r (locking ps
+                (if (identical? (aget args i) args)
+                  (do (aset args i nil) nil)
+                  [(aget args i)]))]
+        (if (nil? r)
+          (let [x @input]
+            (if (locking ps (if (identical? (aget args i) args)
+                              true
+                              (do (aset args i x) false)))
+              (recur)
+              x))
+          (nth r 0))))))
 
 (defn transfer [^Process ps]
   (let [c       (.-combinator ps)
