@@ -117,6 +117,21 @@
 
 ;; --------------------------------------------------------------- cancellation
 
+(def ^:private ^:dynamic *cancelling*
+  "True while we are inside a canceller.
+
+  The task protocol says a canceller \"must not block the calling thread\", and
+  ebb's resumption handshake blocks by construction. The two meet whenever a
+  canceller completes its task synchronously -- `sleep` does exactly that,
+  failing with Cancelled from inside the cancel call -- so the handshake has to
+  stand down for that one path.
+
+  It is not a shortcut: cancelling a join of 100 children cancels them in a
+  loop, and each one waiting for its child to park cost ~1.2ms, or 120ms in
+  series. Missionary has no equivalent cost because its bodies run inline on the
+  cancelling thread, which is work rather than waiting."
+  false)
+
 (defn- arm!
   "Make cancel the process's current cancellation target. If the process has
   already been killed, cancel the task straight away instead -- missionary's
@@ -125,7 +140,7 @@
   (loop []
     (let [t @(.-token ps)]
       (if (nil? t)
-        (cancel)
+        (binding [*cancelling* true] (cancel))
         (when-not (compare-and-set! (.-token ps) t cancel) (recur))))))
 
 (defn kill
@@ -141,7 +156,7 @@
   (loop []
     (when-some [t @(.-token ps)]
       (if (compare-and-set! (.-token ps) t nil)
-        (t)
+        (binding [*cancelling* true] (t))
         (recur))))
   nil)
 
@@ -162,13 +177,17 @@
   that is a task that completed synchronously inside suspend, and the body will
   simply carry on down the stack we are standing on."
   [^Process ps p v]
-  (if (some? *process*)
+  (if (or *cancelling* (some? *process*))
     ;; The resumer is itself a process. Missionary's ordering contract is a
     ;; contract with the OUTSIDE -- a test, lolcat, a timer -- that a callback
     ;; drives the process to its next park before returning. Nothing depends on
     ;; one process blocking on another's progress, and doing so deadlocks: eight
     ;; processes sharing a semaphore, cancelled together, each end up waiting on
     ;; a gate only a peer that is itself waiting could open.
+    ;;
+    ;; The *cancelling* case is the protocol's own rule: a canceller must not
+    ;; block, so a task that fails from inside its own canceller -- `sleep` --
+    ;; delivers and returns, and the body advances on its own fiber.
     (deliver p v)
     (let [g (promise)]
       (swap! (.-gate ps) conj g)
