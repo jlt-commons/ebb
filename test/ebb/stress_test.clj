@@ -186,12 +186,13 @@
   ;; at once must still leave exactly one notification outstanding, and the
   ;; change made once they are all done must reach the consumer.
   ;;
-  ;; What is NOT asserted is that the values arrive in the order the reference
-  ;; took them. `add-watch` hands the callback the new state, but two callbacks
-  ;; racing can reach the process in either order, so the consumer can see a
-  ;; later state before an earlier one. That is true of missionary on the JVM
-  ;; too -- hence the sentinel, written by this thread once the writers are
-  ;; joined, rather than a highest-value-wins finish.
+  ;; What is NOT asserted is that the consumer sees every state, or each one
+  ;; once. `m/watch` derefs the reference on transfer rather than taking the
+  ;; watcher's argument (missionary #89, ebb-8nq.39), so it reports whatever
+  ;; the reference holds when the consumer gets there -- intermediate states
+  ;; are skipped, and a change landing between the readiness mark and the
+  ;; deref can produce the same value twice. Both are allowed; losing the LAST
+  ;; state is not, which is what the sentinel below pins.
   (dotimes [_ 5]
     (let [a   (atom 0)
           out (promise)]
@@ -206,7 +207,7 @@
         ;; a lost flip shows up as the readiness sentinel -- the Process
         ;; itself -- being transferred as though it were a value
         (is (every? #(or (integer? %) (= ::end %)) v))
-        (is (apply distinct? v))))))
+        (is (= [::end] (filter #{::end} v)) "the sentinel arrives exactly once")))))
 
 (deftest observe-delivers-every-accepted-event-once
   ;; Observe's producer is whatever the user's subject hands the emit function

@@ -315,6 +315,33 @@
     ((m/sp (m/? mbx)) (fn [_]) (fn [_]))
     (t/is (nil? (mbx :b)) "post with a waiter")))
 
+(t/deftest watch-does-not-discard-the-latest-value-89
+  ;; #89: OPEN upstream, and ebb FIXES it -- a deliberate divergence, recorded
+  ;; in doc/conformance.md.
+  ;;
+  ;; References do not order their watches. Both of missionary's impls store
+  ;; the watcher's fourth argument, so two threads swapping x -> (f1 x) ->
+  ;; (f2 (f1 x)) can deliver their callbacks in either order and the later
+  ;; state is lost. The issue states the fix: "A correct implementation of
+  ;; `watch` should ignore the value passed to the callback and deref on
+  ;; transfer." `ebb.impl.watch` does that.
+  ;;
+  ;; The repro is the issue's own, and it must always be 2. Before the fix ebb
+  ;; gave 1 twice in 40; missionary b.47 gives 1 once in 300. Ebb is at 0 in
+  ;; 300 now, so the count here is what it takes for the assertion to mean
+  ;; something.
+  (let [rs (atom [])]
+    (dotimes [_ 300]
+      (let [!x   (atom 0)
+            inc! (m/via m/cpu (swap! !x inc))
+            p    (promise)]
+        ((m/reduce (comp reduced {}) nil
+           (m/sample (fn [x _] x) (m/watch !x) (m/ap (m/? (m/join {} inc! inc!)))))
+         (fn [v] (deliver p v)) (fn [e] (deliver p [:err (ex-message e)])))
+        (swap! rs conj (deref p 3000 :timeout))))
+    (t/is (= {2 300} (frequencies @rs))
+          "the sample must see the state both increments produced")))
+
 (t/deftest indirect-breakpoint-calls-are-legal-127
   ;; #127: OPEN upstream, and the one place ebb answers a question missionary
   ;; has not. `m/?` called from a plain function that a coroutine calls:

@@ -157,17 +157,6 @@ the shorter input; `#126` `latest` with zero inputs; `#125` `signal` reporting
 an uninitialised flow instead of leaking; `#115` a sleep spawned from another
 sleep's termination callback not running user code on an interrupted thread.
 
-**Open upstream, and ebb has the same bug.** `#89` — `m/watch` takes the new
-state from the watch callback's fourth argument, and references do not order
-their watches, so two concurrent `swap!`s can reach the process in the wrong
-order and the latest state is lost. The maintainer's stated fix is to ignore the
-callback's value and deref on transfer. Ebb ports the `.cljs` impl and has it
-too, about fifteen times more often — 2 wrong in 40 against missionary's 1 in
-300 on the issue's own repro, presumably because a fiber pool spaces the two
-`via cpu` callbacks further apart. Not fixed, because fixing it would make ebb
-*better* than missionary and therefore a divergence to list here; `ebb-8nq.39`
-carries the decision.
-
 **Open upstream, and ebb does not have the bug.** `#116` — cancelling an `ap`
 propagates into every child branch, which missionary does not do. `#85` —
 posting to a mailbox returns nil, as documented. `#81` — a throw out of a timer
@@ -192,6 +181,20 @@ cooperative and a body that swallows the interrupt has not been cancelled.
 function with no arguments rather than taking the first element, as
 `clojure.core` would; ebb matches, and the test is what will say ebb has to
 change if missionary does.
+
+**Open upstream, and ebb fixes it.** `#89` — `m/watch` takes the new state from
+the watch callback's fourth argument, and references do not order their watches,
+so two concurrent `swap!`s can reach the process in the wrong order and the later
+state is lost. Ebb had it too, and about fifteen times more often: 2 wrong in 40
+against missionary b.47's 1 in 300 on the issue's own repro, a fiber pool spacing
+the two `via cpu` callbacks further apart than a thread pool does. Ebb now takes
+the fix the maintainer states in the issue — ignore the callback's value, deref
+the reference on transfer — and is 0 in 300. **This is a deliberate divergence**:
+`m/watch` no longer reports the states its callbacks carried but whatever the
+reference holds when the consumer gets there, so it skips more intermediate
+states, and a change landing between the readiness mark and the deref can
+produce the same value twice. Losing the *last* state is what it no longer does.
+See `ebb.impl.watch`'s header for why the mark must precede the deref.
 
 **Open upstream, and ebb answers the question.** `#127` — `m/?` called from a
 plain function that a coroutine calls. Missionary calls this undefined and it
