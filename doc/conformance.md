@@ -157,6 +157,17 @@ the shorter input; `#126` `latest` with zero inputs; `#125` `signal` reporting
 an uninitialised flow instead of leaking; `#115` a sleep spawned from another
 sleep's termination callback not running user code on an interrupted thread.
 
+**Open upstream, and ebb has the same bug.** `#89` — `m/watch` takes the new
+state from the watch callback's fourth argument, and references do not order
+their watches, so two concurrent `swap!`s can reach the process in the wrong
+order and the latest state is lost. The maintainer's stated fix is to ignore the
+callback's value and deref on transfer. Ebb ports the `.cljs` impl and has it
+too, about fifteen times more often — 2 wrong in 40 against missionary's 1 in
+300 on the issue's own repro, presumably because a fiber pool spaces the two
+`via cpu` callbacks further apart. Not fixed, because fixing it would make ebb
+*better* than missionary and therefore a divergence to list here; `ebb-8nq.39`
+carries the decision.
+
 **Open upstream, and ebb does not have the bug.** `#116` — cancelling an `ap`
 propagates into every child branch, which missionary does not do. `#85` —
 posting to a mailbox returns nil, as documented. `#81` — a throw out of a timer
@@ -177,6 +188,28 @@ the suite something.
 cancelling a `via` whose body catches `Throwable` still *succeeds*, with
 whatever the handler returned; that is correct, because cancellation is
 cooperative and a body that swallows the interrupt has not been cancelled.
+`#131` — arity 2 of `reduce` and `reductions` seeds by calling the reducing
+function with no arguments rather than taking the first element, as
+`clojure.core` would; ebb matches, and the test is what will say ebb has to
+change if missionary does.
+
+**Open upstream, and ebb answers the question.** `#127` — `m/?` called from a
+plain function that a coroutine calls. Missionary calls this undefined and it
+throws, because cloroutine rewrites `?` at the syntactic breakpoint and a call
+one frame down finds no coroutine state. Ebb has no coroutine to rewrite: an
+`sp` body owns a fiber and `?` parks it, so depth is irrelevant and it simply
+works — the issue's own option 2, decided by the runtime rather than by us. See
+*`sp` is a superset* above.
+
+**Regressions checked and present.** `#69` continuous operators skipping work on
+duplicates (`latest` does not recombine when nothing changed); `#75` a
+`group-by` consumer terminating immediately on input crash; `#130` two
+consecutive derefs of a signal with no ready callback between them. All three
+were compared against missionary b.47 directly rather than reasoned about.
+
+**No repro to run.** `#94` (make `ap`'s switch continuous-time like `cp`'s),
+`#101` (fairness for `sem`/`dfv`/`mbx`/`rdv`), `#102` (bound `mbx` and `blk`)
+are upstream design requests with no observable behaviour to pin.
 
 `#86` — `(ap (?< input) (try (loop [] (amb (? never) (recur))) (catch Cancelled _ (amb))))`
 infinite-loops in missionary on the second input, because it resumes the `amb`'s

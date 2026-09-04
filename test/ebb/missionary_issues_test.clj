@@ -14,6 +14,12 @@
   (:require [ebb.core :as m]
             [clojure.test :as t]))
 
+(defn- run-task
+  "A plain function that parks -- the indirection #127 is about. Deliberately
+  NOT a macro and NOT inlined."
+  [task]
+  (m/? task))
+
 (defn- settle
   "Run task to completion, returning [:ok v] or [:err e]. Never throws, so a
   test can assert on a failure without wrapping every call."
@@ -242,6 +248,65 @@
     (t/is (= [:ready :done [:err true]] @log)
           "cancelling fails the ?< input; that one transfer throws and ends the flow")))
 
+(t/deftest group-by-terminates-on-input-crash-75
+  ;; #75: CLOSED upstream. A group's consumer must terminate as soon as the
+  ;; input crashes rather than waiting for a value that is never coming.
+  (let [[tag e] (settle (m/reduce conj []
+                          (m/ap (let [[k gf] (m/?> ##Inf (m/group-by even?
+                                                (m/ap (m/amb 1 2 (throw (ex-info "nope" {}))))))]
+                                  [k (m/? (m/reduce conj [] gf))]))))]
+    (t/is (= :err tag))
+    (t/is (= "nope" (ex-message e)) "the input's own failure, not a timeout or a hang")))
+
+(t/deftest continuous-operators-skip-duplicates-69
+  ;; #69: CLOSED upstream. "When a continuous flow is sampled, if the current
+  ;; value is = to the previous one, it is not a change and nothing meaningful
+  ;; should happen" -- `latest` must not call its combinator again.
+  ;;
+  ;; 20 resets to the value the reference already holds, then one real change.
+  ;; `add-watch` fires on every reset, so the operator, not the reference, is
+  ;; what has to notice.
+  (let [calls (atom 0)
+        !a    (atom :x)
+        !b    (atom :y)
+        p     (promise)]
+    ((m/reduce (fn [n _] (if (= n 3) (reduced n) (inc n))) 0
+       (m/latest (fn [a b] (swap! calls inc) [a b]) (m/watch !a) (m/watch !b)))
+     (fn [_] (deliver p :done)) (fn [e] (deliver p [:err e])))
+    (dotimes [_ 20] (reset! !a :x))
+    (Thread/sleep 50)
+    (reset! !a :changed)
+    (deref p 2000 :timeout)
+    (t/is (= 1 @calls) "the combinator runs once, not once per no-op reset")))
+
+(t/deftest signal-tolerates-consecutive-derefs-130
+  ;; #130: CLOSED upstream -- worked in b31, broke in b44, fixed since. Two
+  ;; derefs of a signal with no ready callback between them threw. The second
+  ;; one here answers the same value; cancelling then fails the subscription.
+  ;;
+  ;; Asserted as the whole trace because the terminator's position in it is
+  ;; part of the behaviour, and it is what missionary produces for the same
+  ;; program, checked against b.47 rather than reasoned about.
+  (let [flow (m/signal (m/reductions {} :init (m/ap (m/amb 1 2))))
+        log  (atom [])
+        ps   (flow #(swap! log conj :ready) #(swap! log conj :done))]
+    (Thread/sleep 100)
+    (swap! log conj (try [:v1 (deref ps)] (catch Throwable e [:err (ex-message e)])))
+    (swap! log conj (try [:v2 (deref ps)] (catch Throwable e [:err (ex-message e)])))
+    (ps)
+    (t/is (= [:ready :done [:v1 2] :done [:err "Signal subscription cancelled."]] @log))))
+
+(t/deftest reduce-arity-2-seeds-with-the-reducer-131
+  ;; #131: OPEN upstream, and a REQUEST rather than a defect -- arity 2 of
+  ;; `reduce` and `reductions` seeds by calling the reducing function with no
+  ;; arguments, where clojure.core would take the first element as the seed and
+  ;; start from the second. Ebb matches missionary; if missionary changes, this
+  ;; test is what says ebb has to as well.
+  (t/is (= [:ok 6] (settle (m/reduce + (m/seed [1 2 3])))))
+  (t/is (= [:ok 0] (settle (m/reduce + (m/seed [])))) "(+) seeds an empty input")
+  (t/is (= [:ok [0 1 3 6]] (settle (m/reduce conj [] (m/reductions + (m/seed [1 2 3]))))))
+  )
+
 (t/deftest mbx-post-returns-nil-85
   ;; #85: the docs say posting returns nil; missionary could return non-nil.
   (let [mbx (m/mbx)]
@@ -249,6 +314,26 @@
   (let [mbx (m/mbx)]
     ((m/sp (m/? mbx)) (fn [_]) (fn [_]))
     (t/is (nil? (mbx :b)) "post with a waiter")))
+
+(t/deftest indirect-breakpoint-calls-are-legal-127
+  ;; #127: OPEN upstream, and the one place ebb answers a question missionary
+  ;; has not. `m/?` called from a plain function that a coroutine calls:
+  ;;
+  ;;   (defn run-task [task] (m/? task))
+  ;;   ((m/sp (run-task (m/sleep 1000))) prn prn)
+  ;;
+  ;; missionary calls this undefined and it throws -- cloroutine rewrites `?`
+  ;; at the syntactic breakpoint, so a call one frame down finds no coroutine
+  ;; state:
+  ;;   Cannot invoke "clojure.lang.IFn.invoke(Object)" because the return
+  ;;   value of "clojure.lang.RT.aget(Object[], int)" is null
+  ;;
+  ;; Ebb has no coroutine to rewrite. An `sp` body owns a fiber and `?` parks
+  ;; it (ADR-001), so depth is irrelevant and this simply works. That lifts
+  ;; cloroutine's lexical restriction and is recorded in doc/conformance.md as
+  ;; a deliberate superset -- missionary's option 2 in the issue, decided by
+  ;; the runtime rather than by us.
+  (t/is (= [:ok :via-fn] (settle (m/sp (run-task (m/sleep 10 :via-fn)))))))
 
 (t/deftest ap-with-unbounded-parallelism-108
   ;; #108: (m/?> ##Inf ...) over many tasks. Ebb is correct and roughly linear
