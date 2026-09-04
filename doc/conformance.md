@@ -113,9 +113,11 @@ enqueues on the owner rather than resuming inline. `sp` does not.
 
 ## Known defects
 
-The suite is **14 runs in 15 clean, with no hangs**. What remains, and what was
-fixed, is worth stating precisely because most of it was found by measurement
-rather than by reading.
+The suite is **39 runs in 40 clean, with no hangs**, and the one failure is
+`reactor-delayed` timing out against its 10ms budget — the same case that has
+been the only flake since `ebb-8nq.30`, at the same rate. What remains, and what
+was fixed, is worth stating precisely because most of it was found by
+measurement rather than by reading.
 
 ### Fixed
 
@@ -123,14 +125,20 @@ rather than by reading.
 |---|---|
 | Suite hung ~1 run in 7, 6/6 at 16 carriers | `Sleep` completed twice — a non-atomic flag arbitrating the timer against the canceller — and two resumers then deadlocked on a single-cell gate. Found by enumerating interleavings ([model/](../model/README.md)), not by re-running. |
 | `rendezvous` overran its 200ms budget | `race-join` started children in series and each start blocked until the child's first park: ~100ms for 100 children, and the spawn loop was uninterruptible meanwhile. Starts are now batched. |
-| `reactor-delayed`, `reactor-double-sub` | Propagation had **no critical section**, so two fibers could propagate one process and one nilled `.-current` while the other read its ranks. Now a claim/trampoline: commit under the process monitor, propagate outside it. |
+| `reactor-delayed`, `reactor-double-sub` — no critical section | Propagation had **no critical section**, so two fibers could propagate one process and one nilled `.-current` while the other read its ranks. Now a claim/trampoline: commit under the process monitor, propagate outside it. |
 | Silent hang under load | `ebb.impl.server` read `offer!` returning false as "retired" when it also means "full", and ran the thunk inline on the caller — resuming a continuation off its owner fiber. The mailbox is unbounded now. |
+| `reactor-delayed`, 2 full-suite runs in 50 — a shared context | `ebb.impl.reactor`'s `current` and `delayed` were plain globals where `Reactor.java` uses a `ThreadLocal`, so a propagation on one fiber was in scope for every other: an event raised from a timer fiber took `event`'s in-context branch and read `(.-current ps)` — nilled on the propagation's way out — as a null `.-ranks`. Per-fiber was tried before and fails the other way, deterministically, because a reactor's `ap` runs on its own owner fiber. Neither unit is the `ThreadLocal`'s: what it delimits is the dynamic extent of the call, so both are now *carried locals* that travel with the `server/call!` handshake — and back, since `schedule` writes `delayed` from inside a notifier and the outermost `event` is what drains it. ADR-001 rule 6. |
+| `ap` with high parallelism stalled ~1 run in 15 (`#108`'s shape) | `ebb.impl.reduce` carried the `.cljs` `busy` toggle and none of `Reduce.java`'s `synchronized (p)`. `(set! busy (not busy))` is a read and a write, so a notification raised from the `ap`'s owner fiber while the starting thread ran its own first round lost a flip: the reduction went idle with `result` still at the initial accumulator while its input sat notified with all 400 values queued. Arbitration is now a CAS claim on one atom — the monitor is unportable here, since `ready` derefs the input and that parks (ADR-001 rule 5). `ebb-8nq.32` audits the operators that still toggle unsynchronised. |
+| Every other ported flow operator toggled `busy` unsynchronised | The same lost flip as `reduce` above, unfixed in nine more files (`ebb-8nq.32`). The claim protocol is now `ebb.impl.arbiter`, and `reductions`, `relieve`, `sample`, `buffer` and `group-by` all use it; `eduction` uses the atomic counter `Eduction.java` uses instead of a monitor; `watch`, `observe` and the parts of `sample`/`relieve`/`buffer`/`group-by` a claim cannot reach use `locking` over field updates with every deref and callback outside it; `continuous` and `affine` carry headers saying why their ports need no arbitration at all. Nothing in the suite reproduced any of them, so `test/ebb/stress_test.clj` was written to — its `racing` driver raises the input's next notification from an executor that is already running, released the instant the consumer takes a value, and it fails all five of the old implementations. |
+| `ap`/`cp` notifiers blocked their caller | Every callback ebb handed out was a synchronous `server/call!`, which both protocols forbid: a notifier, a terminator, a canceller and both task continuations *must not block the calling thread* (`ebb-8nq.29`). They are `server/cast!` now — enqueue and return. What blocked the fix was not the runtime but lolcat; see below. |
+| A cast lost when its owner fiber retired | Found by the fix above. A sender read `live`, the owner retired and took its last drain, and only then did the sender enqueue. A `call!` at least hangs its caller; a cast has nobody waiting, so the message just disappeared — a cancel that never happens and a process that never terminates. `ebb.impl.server` now sets `drained` *before* the final drain, so a sender that reads it runs its own message and one that does not has already enqueued for that drain. |
+| `ebb.impl.propagator` kept one global `Context` | Also found by the fix above, and the same defect as `ebb-8nq.30` in a second file: `Propagator.java` has `ThreadLocal<Context> context = ThreadLocal.withInitial(Context::new)`, `Propagator.cljs` has a global, and ebb had the global. `enter` claims the outermost slot by finding `cursor` nil and `leave` releases it, so two propagations sharing one Context see each other's — the second is told it is nested, does not drain `delayed`, and the process waiting there is never ticked. Silent: the flow stops. Now two cells, because the `ThreadLocal` was doing two jobs — a per-executor Context reused between propagations (`withInitial`), and a *carried* local naming the one in flight (ADR-001 rule 6), set only between `enter` and its matching `leave` so that `cast!` stays a cast the rest of the time. `(m/reduce f nil (m/signal (m/ap (m/? m/never))))` hung 9 runs in 300 on the two of these together. |
 
 ### Open
 
-- **`ap` with high parallelism intermittently stalls** (`ebb-8nq.31`). `(m/?> ##Inf …)` over 400 tasks takes 69ms standalone and occasionally exceeds 20s under suite load. Three orders of magnitude is a stall, not slowness. This is missionary's own `#108` shape.
-- **`ap`/`cp` notifiers block** (`ebb-8nq.29`), which both protocols forbid outright. Fixing it was implemented and measured: it fails 9 of missionary's own `ap_test`/`cp_test` cases, because lolcat is a synchronous DSL in which "the notification arrives a moment later" cannot be expressed. It needs lolcat adapted or replaced.
-- **The reactor context is global** (`ebb-8nq.30`), where the Java uses a `ThreadLocal`. Per-fiber was tried and is *wrong* for ebb: a reactor's `ap` runs on its own owner fiber, so a fiber-local context is invisible exactly where the subscription happens. The right unit is the reactor process.
+- **`?<` does not interrupt a branch that has forked** (`ebb-8nq.34`). `?<` in an `ap` promises that each new value interrupts the branch in flight, and ebb delivers that only when the branch is parked on a task *directly*: `ebb.impl.ambiguous` keeps one cancel fn on the switch's own `Choice`, so as soon as the branch forks — any `?>`, any `amb` of two or more forms — the switch has no handle on it and the old branch runs on beside the new one. `Ambiguous.java` walks the replaced branch's whole subtree instead. Debounce, the canonical `?<` shape, is correct today.
+- **`sample`'s discard and its resample are not mutually exclusive** (`ebb-8nq.33`). `Sample.java` holds the monitor across both derefs of a slot; ebb cannot, so an input notifying twice before the combinator gets to it can be drained at the same moment `transfer` is resampling it.
+- **Inside a reactor, `ap`/`cp` callbacks are still synchronous.** `server/cast!` degrades to `call!` when the caller has ambient context in scope, because a carried local stands in for a `ThreadLocal` and the callee's writes have to be visible to the caller on return — a cast has no reply to bring them back in. ADR-001 rule 6.
 
 No test budget has been widened. A test far inside its budget that still trips
 is reporting something real.
@@ -147,9 +155,18 @@ sleep's termination callback not running user code on an interrupted thread.
 
 **Open upstream, and ebb does not have the bug.** `#116` — cancelling an `ap`
 propagates into every child branch, which missionary does not do. `#85` —
-posting to a mailbox returns nil, as documented. `#108` — `(m/?> ##Inf …)` over
+posting to a mailbox returns nil, as documented. `#81` — a throw out of a timer
+callback kills missionary's single scheduler thread and deadlocks every later
+`m/sleep`; ebb runs each timer callback on its own fiber, so it is contained to
+that fiber and reported by name. (`(m/? (m/ap …))`, the expression the issue
+uses to provoke it, still never completes under ebb: it applies a flow where a
+task is expected, so the callback that would have completed it is the one that
+threw. That is the malformed call, not the timer, and the test asserts the
+difference.) `#108` — `(m/?> ##Inf …)` over
 many tasks is correct and roughly linear at 400; the reported knee is higher,
-and `ebb-8nq.25` tracks finding it.
+and `ebb-8nq.25` tracks finding it. This is the test that caught the lost
+notification in `reduce` above, which is why it is kept at a size that costs
+the suite something.
 
 **Open design questions, where matching missionary is the answer.** `#111` —
 `(m/sem 0)` and `(m/sem -1)` construct, and acquiring blocks. `#82` —
@@ -157,9 +174,17 @@ cancelling a `via` whose body catches `Throwable` still *succeeds*, with
 whatever the handler returned; that is correct, because cancellation is
 cooperative and a body that swallows the interrupt has not been cancelled.
 
-Two are still open against ebb itself: `ebb-8nq.26` (`#81`'s first expression
-hangs, though ebb is immune to the scheduler poisoning the issue is about — the
-timer survives) and `ebb-8nq.27` (`#86`'s event trace).
+`#86` — `(ap (?< input) (try (loop [] (amb (? never) (recur))) (catch Cancelled _ (amb))))`
+infinite-loops in missionary on the second input, because it resumes the `amb`'s
+second alternative after the `Cancelled` has already unwound past it into the
+catch. Ebb does not: a throw abandons the continuation the fork would have
+resumed. The correct trace has **no value in it at all** — `amb` is sequential,
+its first alternative is `(? never)`, which neither produces nor terminates, so
+the second can never start; a branch here can only end by being cancelled, and a
+cancelled branch evaluates to `(amb)`. The flow's one and only notification is
+the one cancellation produces, and the transfer answering it throws `Cancelled`
+and ends the flow. The `#(prn :ready)` consumer in the issue never transfers,
+which is why the trace originally recorded against this looked truncated.
 
 ## Tests not ported, and why
 
@@ -199,6 +224,26 @@ Two things that rule turns out to require, both learned by getting them wrong:
   a ~25% flake on `reactor-delayed`, whose body actually completes in under a
   millisecond against a 10ms budget -- the failure looked like ebb being slow and
   was not.
+
+### lolcat had to change too, for the same reason
+
+`lolcat.core/call` runs a function and then requires every event that function
+was *declared* to raise to have already been raised. That is only true when the
+callbacks run inline on the caller, which is missionary's model and not ebb's:
+under ADR-001 rule 2 every callback an `ap` or `cp` hands out is a `cast!` onto
+its owner fiber, so the event lands a moment after the call returns.
+
+Each `call` now carries a promise, delivered when the last of its declared events
+is consumed, and `call-attempt` waits on it for up to `*event-timeout*` (2s)
+before it checks. What is relaxed is only **when**: the same events, in the same
+declared order, one instruction later instead of before the call returns. A call
+with nothing outstanding never touches the promise -- which matters, because
+`observe_test`'s `overflow` runs one with the thread's interrupt flag
+deliberately set, and a blocking deref there is observable.
+
+The cost is that a genuinely missing event now takes 2s to report instead of
+being instant. That bought 8 of the 9 `ap_test`/`cp_test` cases that made
+`ebb-8nq.29` look unfixable.
 
 ## Implementation notes that are not divergences
 

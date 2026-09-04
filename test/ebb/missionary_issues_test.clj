@@ -73,6 +73,110 @@
     (Thread/sleep 200)
     (t/is (= [:done] @events) "cancellation must propagate into every branch")))
 
+(t/deftest a-throwing-consumer-does-not-poison-the-timer-81
+  ;; #81: `(m/? (m/ap ...))` applies a FLOW where a task is expected, so the ap
+  ;; gets `success`/`failure` as its notifier and terminator and calls the
+  ;; notifier with no arguments. In missionary the resulting ArityException
+  ;; reaches the one scheduler thread, kills it, and every later `m/sleep` in
+  ;; the process deadlocks.
+  ;;
+  ;; Ebb gives every timer callback its own fiber (ebb.impl.util/schedule!), so
+  ;; the throw is contained to that fiber and reported by name. The line
+  ;;
+  ;;   ebb: uncaught in timer callback: Wrong number of args (0) passed to: fn
+  ;;
+  ;; on stderr during this test is that report, and it is the point.
+  ;;
+  ;; The malformed expression itself never completes. That is not a defect and
+  ;; not what #81 is about: nothing ever calls the continuation `m/?` is waiting
+  ;; on, because the callback that would have is the one that threw. What is
+  ;; asserted is that it costs the rest of the runtime nothing.
+  (t/is (= [:ok :before] (settle (m/sleep 20 :before) 1000)))
+  (let [stuck (promise)]
+    (doto (Thread.
+            (fn [] (try (deliver stuck
+                          [:ok (m/? (m/ap (let [d (m/?> ##Inf (m/seed [10]))]
+                                            (m/? (m/sleep d d)))))])
+                        (catch Throwable e (deliver stuck [:err (ex-message e)])))))
+      (.setDaemon true)
+      (.start))
+    (t/is (= [:err ::stuck] (deref stuck 500 [:err ::stuck]))
+          "nothing completes it, so it waits -- that is the malformed call, not the timer"))
+  (t/is (= [:ok :after] (settle (m/sleep 20 :after) 1000))
+        "the timer must still be alive")
+  (t/is (= [:ok [:x :y]]
+          (settle (m/reduce conj [] (m/ap (m/? (m/sleep 10 (m/?> (m/seed [:x :y])))))) 1000))
+        "and so must a whole ap-over-sleep pipeline"))
+
+(t/deftest ap-switch-over-amb-recur-terminates-86
+  ;; #86: OPEN upstream. The repro, verbatim:
+  ;;
+  ;;   (def input (m/observe (fn [!] (def i! !) #(do))))
+  ;;   ((m/ap (m/?< input)
+  ;;          (try (loop [] (m/amb (m/? m/never) (recur)))
+  ;;               (catch Cancelled _ (m/amb))))
+  ;;    #(prn :ready) #(prn :done))
+  ;;   (i! :a)
+  ;;   (i! :b)   ;; missionary spins here, forever
+  ;;
+  ;; Missionary resumes the amb's SECOND alternative after the Cancelled has
+  ;; already unwound past the amb into the catch, so `(recur)` builds a fresh
+  ;; `(m/amb (m/? m/never) ...)` on an already-cancelled branch, which fails at
+  ;; once, is caught again, and recurs again. Ebb does not: a throw abandons the
+  ;; continuation the fork would have resumed, which is what unwinding past an
+  ;; expression means.
+  ;;
+  ;; The correct trace has no value in it anywhere, which is worth spelling out
+  ;; because it reads like an omission -- `(m/amb (m/? m/never) (recur))` looks
+  ;; as though it should make the branch ready as soon as an arm is available.
+  ;; It cannot:
+  ;;
+  ;;   * `m/amb` is SEQUENTIAL, `(?> 1 (seed (range 2)))`, so the second
+  ;;     alternative cannot start until the first one's branch is finished. The
+  ;;     first is `(m/? m/never)`: it never produces and never terminates.
+  ;;   * so a branch of this ap can only end by being cancelled, and a branch
+  ;;     cancelled here evaluates to `(m/amb)` -- no values at all.
+  ;;   * therefore neither `:a` nor `:b` can make the flow ready.
+  ;;   * cancelling the process cancels the `?<` input, and the observe's
+  ;;     transfer fails with Cancelled. THAT is the flow's one and only
+  ;;     notification, and the transfer answering it throws and ends the flow.
+  ;;
+  ;; The bare `#(prn :ready)` consumer in the issue never transfers, so under
+  ;; ebb it prints `:ready` and stops. That is correct -- a flow owes nothing
+  ;; further until the transfer it is waiting for -- and it is why the trace
+  ;; originally recorded against this issue looked truncated.
+  ;;
+  ;; What ebb gets WRONG here is invisible in this trace and tracked separately:
+  ;; `:b` ought to cancel the branch `:a` started, and does not, because ebb's
+  ;; `?<` only interrupts a task the branch is parked on DIRECTLY (ebb-8nq.34).
+  ;; Both branches yield nothing either way, so the trace is the same.
+  (let [emit  (promise)
+        input (m/observe (fn [!] (deliver emit !) (fn [])))
+        log   (atom [])
+        itr   (atom nil)
+        ps    ((m/ap (m/?< input)
+                 (try (loop [] (m/amb (m/? m/never) (recur)))
+                      (catch Throwable e (if (m/cancelled? e) (m/amb) (throw e)))))
+               (fn [] (swap! log conj :ready)
+                 (swap! log conj (try [:val (deref @itr)]
+                                      (catch Throwable e [:err (m/cancelled? e)]))))
+               (fn [] (swap! log conj :done)))
+        i!    (deref emit 1000 nil)]
+    (reset! itr ps)
+    (t/is (some? i!) "the observe subscribed")
+    (i! :a)
+    (Thread/sleep 100)
+    (t/is (= [] @log) "the amb's first alternative never produces, so nothing is ready")
+    (i! :b)
+    (Thread/sleep 100)
+    (t/is (= [] @log) "switching away from :a yields nothing -- and does not spin")
+    (ps)
+    (Thread/sleep 200)
+    ;; the terminator fires from inside the transfer, before it throws, which is
+    ;; why :done is logged ahead of the failure it terminates on.
+    (t/is (= [:ready :done [:err true]] @log)
+          "cancelling fails the ?< input; that one transfer throws and ends the flow")))
+
 (t/deftest mbx-post-returns-nil-85
   ;; #85: the docs say posting returns nil; missionary could return non-nil.
   (let [mbx (m/mbx)]

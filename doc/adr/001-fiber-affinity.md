@@ -110,12 +110,37 @@ a timer thread completing a task, another fiber notifying upstream, the
 consumer's thread transferring downstream, anyone cancelling. None of those may
 touch process state or resume a continuation directly.
 
-So such a process gets one owner fiber, an inbox, and every entry point becomes
-a synchronous request/reply through it: `gen_server:call`, not `!`, because the
-caller needs the reply or at least needs the work to have happened before it
-continues. That server is `ebb.impl.server`, shared by `ap` and `cp`. A call already *on* the owner runs inline rather than deadlocking,
-which is the common case -- the owner notifies downstream and downstream
-transfers straight back in.
+So such a process gets one owner fiber and an inbox, and every entry point goes
+through it. That server is `ebb.impl.server`, shared by `ap` and `cp`. A message
+sent from the owner's own fiber runs inline rather than deadlocking, which is the
+common case -- the owner notifies downstream and downstream transfers straight
+back in.
+
+**Which entry points are `call!` and which are `cast!`.** Not all of them need
+the reply, and Erlang's distinction is the right one here too:
+
+- **`call!` -- `gen_server:call`.** The *transfer*, because it returns the value
+  the caller asked for, and the *start*, because missionary's contract is that a
+  process has reached its first park before the call that started it returns.
+- **`cast!` -- `!`.** Everything ebb hands OUT: the notifier and terminator it
+  gives an upstream flow, the two continuations it gives a task, and the
+  canceller it gives downstream. Both protocols say each of these *must not
+  block the calling thread*, and `call!` blocks all of them. Enqueue and return
+  is what the protocol asks for and what the CML rule above already says: the
+  waker does not run the waiter's code.
+
+The single exception is a caller with **ambient context** in scope -- see rule 6.
+A carried local stands in for a `ThreadLocal`, whose whole point is that the
+callee's writes are visible to the caller on return, and a cast has no reply to
+carry them back in. Inside a reactor propagation, therefore, `cast!` degrades to
+`call!`. Nothing outside the reactor registers a carried local, so nothing else
+pays for it.
+
+Making these casts cost nothing in the runtime and a great deal in the test
+suite, which is why it took a second pass (`ebb-8nq.29`): lolcat, missionary's
+own DSL, required every event a `call` declared to have been raised before that
+call returned, which is only true when callbacks run inline on the caller. It now
+waits for them instead. Same events, same order, one instruction later.
 
 This is the same conclusion discipline 2 reaches for `sp`, arrived at from the
 other side: there the question was "has the body got anywhere yet", here it is
@@ -228,6 +253,59 @@ holds a counted lock (1 held).
 
 Read `(jolt.scheme/proc "jolt-locks-held")` at the park site to find it. A
 non-zero count on *entry* means the caller is at fault, not the parking code.
+
+### 6. Ambient context travels with the handshake, in both directions
+
+Missionary's Java impls keep three pieces of state in a `ThreadLocal`:
+`Reactor.CURRENT` (which reactor is propagating), `Reactor.DELAYED` (which
+reactors have work queued behind this propagation), and `Propagator.context`
+(the `Context` a publisher's propagation belongs to, `withInitial(Context::new)`).
+The `.cljs` impls use plain globals, which is the same thing when there is one
+thread.
+
+Ebb can use neither, and the reason is worth stating because both wrong answers
+look right:
+
+- A **global** answers "yes, you are inside a propagation" to every fiber in the
+  process. An event raised from a timer fiber while some reactor happened to be
+  propagating then took the in-context branch and read `(.-current ps)` — which
+  the propagation nils on its way out — as a null `.-ranks`.
+- **Per-fiber** is wrong in the opposite direction, and deterministically. On the
+  JVM a reactor's flows run *inline on the propagating thread*, so the
+  `ThreadLocal` reaches them all. In ebb an `ap` or `cp` inside a reactor runs on
+  its own owner fiber (discipline 2), so the subscription made from that fiber
+  finds nothing: `Subscription failure : not in reactor context`.
+
+Neither the thread nor the fiber is the unit. What a `ThreadLocal` delimits,
+given inline execution, is the **dynamic extent of the call** — and ebb's
+stand-in for that extent is the `server/call!` handshake. So state of this kind
+is a *carried local* (`ebb.impl.util/carried-local`): the caller snapshots it
+into the message, the callee installs it for exactly that thunk and restores
+what was there before, and the reply carries the callee's final snapshot back.
+
+The return leg is not symmetry for its own sake. A `ThreadLocal` is one cell
+shared by a caller and everything it calls, so a write by the callee is a write
+the caller sees on return, and the reactor depends on precisely that: `schedule`
+runs from a notifier deep inside a propagation and pushes onto `DELAYED`, while
+the *outermost* `event` is what drains it afterwards. Carry the context down but
+not back and that push is stranded on the callee's fiber, where nothing drains
+it — the reactor stops with no error at all.
+
+What this buys is the distinction the fiber alone cannot make. The same owner
+fiber runs an `ap` both when a propagation pulled it — in the extent of the
+call, so in context — and when a timer resumed it, with no reactor call above
+it and therefore out of context. Only the call chain tells those apart, and the
+JVM gets the same answer for the same reason.
+
+**A `ThreadLocal` with an initial value is two cells, not one**, and
+`Propagator.context` is the case that shows it. `withInitial(Context::new)` says
+both "this executor's own scratch Context, reused" and "the Context of the
+propagation in flight". Only the second is carried; the first is a plain
+`context-local`, allocated once per executor. Carrying both would be worse than
+useless: a carried local that is never unset makes `cast!` degrade to `call!`
+forever (discipline 2), so every callback would go back to blocking. The active
+cell is therefore set by `enter` and cleared by the `leave` that matches it, and
+`(some? (capture-context))` means exactly "a propagation is in flight above me".
 
 ## Consequences
 
