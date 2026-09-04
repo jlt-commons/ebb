@@ -22,7 +22,7 @@
   (invoke [this] (free this) nil)
   (invoke [this n t] (subscribe this n t)))
 
-(deftype Process [success failure ^:unsynchronized-mutable result ^:unsynchronized-mutable kill ^:unsynchronized-mutable boot ^:unsynchronized-mutable alive ^:unsynchronized-mutable active ^:unsynchronized-mutable current ^:unsynchronized-mutable reaction ^:unsynchronized-mutable schedule ^:unsynchronized-mutable subscriber ^:unsynchronized-mutable delayed]
+(deftype Process [success failure ^:unsynchronized-mutable result ^:unsynchronized-mutable kill ^:unsynchronized-mutable boot ^:unsynchronized-mutable alive ^:unsynchronized-mutable active ^:unsynchronized-mutable current ^:unsynchronized-mutable reaction ^:unsynchronized-mutable schedule ^:unsynchronized-mutable subscriber ^:unsynchronized-mutable delayed ^:unsynchronized-mutable claimed ^:unsynchronized-mutable queued]
   clojure.lang.IFn
   (invoke [_] (event kill) nil))
 
@@ -35,12 +35,22 @@
 ;; on a var needs a thread-local binding, and a `binding` is wrong here
 ;; anyway. These are atoms instead, read with @ and written with reset!,
 ;; which is what missionary's `fiber` global amounts to as well.
-;; ThreadLocal<Process> in Reactor.java; a plain global in the .cljs impl,
-;; which is only sound with one thread. Ebb had the global, and a second fiber
-;; then saw `current` set while that process's own `.-current` was nil, which
-;; crashed a reactor with a null `.-ranks`. See ebb.impl.util/context-local.
-(def current (u/context-local))
-(def delayed (u/context-local))
+;; Reactor.java holds these in ThreadLocal<Process>; the .cljs impl uses plain
+;; globals, which is the same thing when there is one thread.
+;;
+;; EBB HAS TO USE GLOBALS, and it is not an oversight -- making them per-fiber
+;; was tried and broke reactor-double-sub deterministically with "Subscription
+;; failure : not in reactor context." On the JVM a reactor's flows run INLINE on
+;; the propagating thread, so a ThreadLocal is visible to all of them. In ebb an
+;; `ap` or `cp` inside a reactor runs on its OWN owner fiber (ADR-001 discipline
+;; 2), so a fiber-local context is invisible exactly where it is needed.
+;;
+;; The right unit is therefore neither the thread nor the fiber but the REACTOR
+;; PROCESS, reaching every fiber that belongs to it. That is ebb-8nq.30. Until
+;; then these stay global, which is sound for one reactor at a time and leaks
+;; between concurrent reactors on different fibers.
+(def current (atom nil))
+(def delayed (atom nil))
 
 (defn lt [x y]
   (if (nil? x)
@@ -86,8 +96,8 @@
     (if-some [sch (.-schedule ps)]
       (set! (.-schedule ps) (link pub sch))
       (do (set! (.-schedule ps) pub)
-          (set! (.-delayed ps) (u/local-get delayed))
-          (u/local-set! delayed ps)))))
+          (set! (.-delayed ps) @delayed)
+          (reset! delayed ps)))))
 
 (defn pull [^Publisher pub]
   (let [ps (.-process pub)
@@ -141,7 +151,7 @@
 
 (defn propagate [^Publisher pub]
   (let [ps (.-process pub)]
-    (u/local-set! current ps)
+    (reset! current ps)
     (loop [pub pub]
       (set! (.-reaction ps) (dequeue pub))
       (set! (.-current ps) pub)
@@ -169,7 +179,7 @@
       (when-some [r (.-reaction ps)]
         (recur r)))
     (set! (.-current ps) nil)
-    (u/local-set! current nil)
+    (reset! current nil)
     (loop []
       (when-some [pub (.-active ps)]
         (set! (.-active ps) (.-active pub))
@@ -214,14 +224,14 @@
   (n) (->Failer t e))
 
 (defn free [^Publisher pub]
-  (when-not (identical? (.-process pub) (u/local-get current))
+  (when-not (identical? (.-process pub) @current)
     (throw (ex-info "Cancellation failure : not in reactor context." {})))
   (cancel pub))
 
 (defn subscribe [^Publisher pub n t]
   (let [ps (.-process pub)
         sub (.-subscriber ps)]
-    (if-not (identical? ps (u/local-get current))
+    (if-not (identical? ps @current)
       (failer n t (ex-info "Subscription failure : not in reactor context." {}))
       (if (identical? sub (.-boot ps))
         (failer n t (ex-info "Subscription failure : not a subscriber." {}))
@@ -235,7 +245,7 @@
 (defn unsubscribe [^Subscription s]
   (let [sub (.-subscriber s)
         ps (.-process sub)]
-    (when-not (identical? ps (u/local-get current))
+    (when-not (identical? ps @current)
       (throw (ex-info "Unsubscription failure : not in reactor context." {})))
     (when-some [pub (.-subscribed s)]
       (set! (.-subscribed s) nil)
@@ -258,7 +268,7 @@
 (defn push [^Subscription s]
   (let [sub (.-subscriber s)
         ps (.-process sub)]
-    (when-not (identical? ps (u/local-get current))
+    (when-not (identical? ps @current)
       (throw (ex-info "Transfer failure : not in reactor context." {})))
     ;; NOT named `value`. A local sharing a name with a mutable deftype field
     ;; reads the FIELD, not the binding, so the snapshot below came back
@@ -283,8 +293,60 @@
             (set! (.-subscriber ps) cur)
             v-val)))))
 
+(defn- propagate-claimed!
+  "Propagate pub, guaranteeing that at most one fiber is inside `propagate` for
+  a given process at a time.
+
+  Reactor.java gets this from `synchronized (pub.process)` held ACROSS the
+  propagation. Ebb cannot hold a lock there: propagate invokes notifiers, ap
+  and cp notifiers park (ebb-8nq.29), and a fiber may not park while its
+  carrier holds a counted lock -- ADR-001 rule 5. A straight port of the
+  monitor hangs the suite, which was measured.
+
+  So this follows jolt's own rule for the situation (host/chez/locks.ss):
+  COMMIT UNDER THE LOCK AND SWITCH OUTSIDE IT. Under the process monitor we
+  decide who propagates; the propagation itself runs with no lock held; then we
+  retake the monitor to hand the claim on. A fiber that loses leaves its
+  publisher on the queue and returns, so no notification is dropped and no
+  caller waits.
+
+  `flip?` is the subtle part. `busy` is a per-PUBLISHER toggle and flipping it
+  to true is how a caller claims the notification. A publisher taken off the
+  queue has ALREADY been flipped by whoever queued it, so flipping again would
+  hand the notification back and lose it."
+  [^Publisher pub flip?]
+  (let [^Process ps (.-process pub)]
+    (loop [pub pub, flip? flip?]
+      (let [go? (locking ps
+                  (if (and flip? (not (set! (.-busy pub) (not (.-busy pub)))))
+                    false                       ; lost the flip: the other side owns it
+                    (if (.-claimed ps)
+                      (do (set! (.-queued ps) (conj (.-queued ps) pub)) false)
+                      (do (set! (.-claimed ps) true) true))))]
+        (when go?
+          ;; The release MUST be in a finally. Without it a throw out of
+          ;; propagate strands the claim set forever, every later event for
+          ;; this process queues behind it and the reactor wedges -- which is
+          ;; what the first version of this did.
+          ;; The callback runs with the claim RELEASED, as Reactor.java invokes
+          ;; it outside the monitor. Holding it across the callback deadlocks
+          ;; the completion path: cb settles the reactor task, whose consumer
+          ;; can re-enter and need the claim we are sitting on.
+          (let [cb (try (propagate pub)
+                        (finally (locking ps (set! (.-claimed ps) false))))]
+            (when cb (cb (.-result ps))))
+          ;; Pick up anything queued while we ran. Re-entering the loop rather
+          ;; than propagating directly is deliberate: another fiber may have
+          ;; taken the claim in between, and then the loop simply queues this
+          ;; one back for them.
+          (when-some [nxt (locking ps
+                            (when-some [q (seq (.-queued ps))]
+                              (set! (.-queued ps) (vec (rest q)))
+                              (first q)))]
+            (recur nxt false)))))))
+
 (defn event [^Publisher pub]
-  (if-some [ps (u/local-get current)]
+  (if-some [ps @current]
     (when (set! (.-busy pub) (not (.-busy pub)))
       (if (identical? ps (.-process pub))
         (if (lt (.-ranks (.-current ps)) (.-ranks pub))
@@ -293,24 +355,22 @@
               (link pub r) pub))
           (schedule pub))
         (schedule pub)))
-    (do (when (set! (.-busy pub) (not (.-busy pub)))
-          (when-some [cb (propagate pub)]
-            (cb (.-result (.-process pub)))))
+    (do (propagate-claimed! pub true)
         (loop []
-          (when-some [ps (u/local-get delayed)]
-            (u/local-set! delayed (.-delayed ps))
+          (when-some [ps @delayed]
+            (reset! delayed (.-delayed ps))
             (set! (.-delayed ps) nil)
             (let [pub (.-schedule ps)]
               (set! (.-schedule ps) nil)
-              (when-some [cb (propagate pub)]
-                (cb (.-result ps)))
+              ;; already flipped by `schedule`, so do not flip again
+              (propagate-claimed! pub false)
               (recur)))))))
 
 (def kill
   (reify
     clojure.lang.IDeref
     (deref [_]
-      (let [ps (u/local-get current)]
+      (let [ps @current]
         (when-some [t (.-alive ps)]
           (loop [pub (.-next t)]
             (cancel pub)
@@ -325,7 +385,7 @@
 (def zero (object-array 0))
 
 (defn run [init s f]
-  (let [ps (->Process s f nil nil nil nil nil nil nil nil nil nil)
+  (let [ps (->Process s f nil nil nil nil nil nil nil nil nil nil false [])
         k (->Publisher ps kill nil 0 0 false false false false nil nil nil nil nil nil)
         b (->Publisher ps (reify clojure.lang.IDeref (deref [_] (init))) zero 0 0 false false false nil nil nil nil nil nil nil)]
     (set! (.-kill ps) k)
@@ -334,7 +394,7 @@
     (event b) ps))
 
 (defn publish [flow continuous]
-  (let [ps (doto (u/local-get current) (-> nil? (when (throw (ex-info "Publication failure : not in reactor context." {})))))
+  (let [ps (doto @current (-> nil? (when (throw (ex-info "Publication failure : not in reactor context." {})))))
         cur (.-subscriber ps)
         pub (->Publisher
               ps nil
