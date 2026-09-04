@@ -91,6 +91,15 @@
 ;;          missionary/impl/Sequential.java, which holds it under the process
 ;;          monitor; ebb's body runs on its own fiber instead, so the token is
 ;;          an atom driven by CAS (ADR-001 rule 1).
+;;
+;; That covers the whole of Sequential.java's monitor, which is the audit item
+;; for this file (ebb-8nq.32). Sequential has no pull loop and no `busy`
+;; toggle: the three regions it synchronises are the token swap in `suspend`,
+;; the token swap in `cancel`, and the read in `check` -- all read-modify-writes
+;; on one cell, and all of them CAS here. The remaining fields are the gate
+;; vector and the done flag, atoms for the same reason. There is nothing left
+;; for a lock to hold, and a lock could not be held anyway: every one of these
+;; paths ends in a park.
 (deftype Process [^:unsynchronized-mutable fiber gate token done])
 
 (def ^:dynamic *process*
