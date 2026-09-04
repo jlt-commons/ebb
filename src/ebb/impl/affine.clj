@@ -70,13 +70,28 @@
   (:require [jolt.fibers :as fib]
             [ebb.impl.util :refer [nop cancelled]]))
 
-;; gate  -- promise the current driver is waiting on, or nil when nobody drives
+;; gate  -- promises of every driver waiting for the body to reach its next
+;;          park. A VECTOR, not a single cell. It was a single cell, and
+;;          model/ebb/model/handshake.clj shows why that is unsound: two
+;;          concurrent resumers install two gates but only the first `deliver`
+;;          wakes the body (the second is a no-op on a realized promise), so
+;;          there is one open for two waiters and one resumer blocks forever --
+;;          in EVERY schedule, not just an unlucky one. A blocked resumer is a
+;;          blocked carrier.
+;;
+;;          A task that completes twice is what produces two resumers;
+;;          ebb.impl.sleep was one such source and is fixed. Draining the whole
+;;          vector makes the handshake correct regardless of whether another
+;;          source remains, which is the property worth having.
+;; done  -- set once the body has finished, so a resumer that arrives after the
+;;          last drain releases itself instead of waiting for a park that will
+;;          never come.
 ;; token -- nil once cancelled; otherwise the cancel fn of the task this process
 ;;          is currently parked on (nop while running). Ported from
 ;;          missionary/impl/Sequential.java, which holds it under the process
 ;;          monitor; ebb's body runs on its own fiber instead, so the token is
 ;;          an atom driven by CAS (ADR-001 rule 1).
-(deftype Process [^:unsynchronized-mutable fiber gate token])
+(deftype Process [^:unsynchronized-mutable fiber gate token done])
 
 (def ^:dynamic *process*
   "The process whose body is running on this fiber, or nil off a process.
@@ -85,9 +100,19 @@
   nil)
 
 (defn- quiescent!
-  "Tell the current driver the process has parked or finished."
+  "Tell every waiting driver the process has parked or finished."
   [^Process ps]
-  (when-some [g @(.-gate ps)] (deliver g true))
+  ;; The empty check is not redundant: most parks have nobody waiting, and it
+  ;; keeps them to a plain deref instead of a swap.
+  (when (seq @(.-gate ps))
+    (doseq [g (first (swap-vals! (.-gate ps) empty))] (deliver g true)))
+  nil)
+
+(defn- finish!
+  "The body has run out. Release every waiter, now and in future."
+  [^Process ps]
+  (reset! (.-done ps) true)
+  (quiescent! ps)
   nil)
 
 ;; --------------------------------------------------------------- cancellation
@@ -146,8 +171,13 @@
     ;; a gate only a peer that is itself waiting could open.
     (deliver p v)
     (let [g (promise)]
-      (reset! (.-gate ps) g)
+      (swap! (.-gate ps) conj g)
       (deliver p v)
+      ;; If the body finished before we joined the queue nobody will drain it
+      ;; again, so drain it ourselves. Ordering both ways is safe: whichever of
+      ;; us observes the other's write does the delivering, and `deliver` on an
+      ;; already-open gate is a no-op.
+      (when @(.-done ps) (quiescent! ps))
       (deref g)))
   nil)
 
@@ -171,14 +201,14 @@
   "Run (f) as a process on its own fiber. Returns the Process once the body has
   reached its first park, completed, or thrown -- not before."
   [f]
-  (let [ps (->Process nil (atom nil) (atom nop))
+  (let [ps (->Process nil (atom []) (atom nop) (atom false))
         g  (promise)]
-    (reset! (.-gate ps) g)
+    (swap! (.-gate ps) conj g)
     (set! (.-fiber ps)
           (fib/spawn
             (fn []
               (binding [*process* ps]
                 (try (f)
-                     (finally (quiescent! ps)))))))
+                     (finally (finish! ps)))))))
     (deref g)
     ps))

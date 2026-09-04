@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run the relational models of ebb's concurrency design (model/).
+# With no argument, runs them all.
+cd "$(dirname "$0")/.."
+if [ $# -gt 0 ]; then exec jolt -A:model -m "ebb.model.$1"; fi
+for m in sleep handshake; do jolt -A:model -m "ebb.model.$m" || exit 1; done

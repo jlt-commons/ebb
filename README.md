@@ -31,14 +31,14 @@ and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
 edited only where [doc/conformance.md](doc/conformance.md) says so: **238
 tests, 278 assertions**.
 
-The defect is in `ebb.core-test`: on the default 4 carriers about 1 run in 5
-fails and 1 in 7 hangs. It is **two** problems — a data race that more
-parallelism makes worse (near-certain on 8+ carriers, never seen on 1–2), and a
-throughput shortfall in three tests that cancel 100 hot-looping processes at
-once. The evidence, including the carrier-count table that separates them, is
-in [doc/conformance.md](doc/conformance.md#known-defects-a-parallelism-race-and-three-tests-that-overrun);
-the bug is `ebb-8nq.23`. Do not treat ebb as production-ready until it is
-closed.
+The remaining defect is throughput, not correctness: three tests cancel 100
+hot-looping processes at once, and for `rendezvous` the 100ms inner phase plus
+a 120ms wind-down does not fit its 200ms budget, so it fails most runs. The
+suite no longer **hangs** — that was two races, found by enumerating
+interleavings rather than by re-running the suite, and the story is worth
+reading in [model/](model/README.md). Details and measurements in
+[doc/conformance.md](doc/conformance.md#known-defect-three-tests-overrun-their-budget);
+the bug is `ebb-8nq.23`.
 
 ## Install
 
@@ -110,6 +110,9 @@ of missionary's sources, warning on the constructs that need a human.
   built on, with its wrong turns corrected inline.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, test and port; the
   conventions a change is expected to follow.
+- [model/README.md](model/README.md) — core.logic models that enumerate every
+  interleaving of the concurrency design. They found the two races behind a
+  hang that re-running the suite could not localise.
 
 ## Why "ebb"
 

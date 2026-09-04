@@ -2,4 +2,9 @@
 
  :aliases
  {:test {:extra-paths ["test"]
-         :main-opts   ["-m" "ebb.runner"]}}}
+         :main-opts   ["-m" "ebb.runner"]}
+
+  ;; Relational model of the concurrency design (model/). Not a dependency of
+  ;; the library -- ebb itself has none.
+  :model {:extra-paths ["model"]
+          :extra-deps  {org.clojure/core.logic {:mvn/version "1.1.0"}}}}}

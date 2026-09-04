@@ -111,74 +111,77 @@ enqueues on the owner rather than resuming inline. `sp` does not.
   state, so left set it survives into the next namespace and kills the first
   blocking wait there.
 
-## Known defects: a parallelism race, and three tests that overrun
+## Known defect: three tests overrun their budget
 
-`ebb.core-test` is unreliable. On the default 4 carriers, roughly 1 run in 5
-fails and 1 in 7 hangs outright, spinning every carrier. Everything else in the
-suite is stable. Tracked as `ebb-8nq.23`.
+`ebb.core-test`'s `rendezvous` fails on roughly 4 runs in 5, and
+`reactor-delayed` occasionally. Everything else in the suite is stable, and the
+suite **no longer hangs**. Tracked as `ebb-8nq.23`.
 
-### There are two problems, and they pull in opposite directions
+### The hang is fixed, and how it was found is worth repeating
 
-Running `ebb.core-test` alone, six runs at each carrier count:
+The suite used to hang outright — about 1 run in 7 on the default 4 carriers,
+and **6 times out of 6 on sixteen**. Hammering it located the namespace and
+little else, because more runs only ever sample more schedules.
 
-| carriers | clean | `Task timed out` | hang |
-|---|---|---|---|
-| 1 | 0 | **6** | 0 |
-| 2 | 2 | 4 | 0 |
-| 4 (default) | 4 | 1 | 1 |
-| 8 | 0 | 1 | **5** |
-| 16 | 0 | 0 | **6** |
+Two relational models under [`model/`](../model/README.md) enumerated *every*
+interleaving instead, and between them explained it end to end:
 
-That separates them cleanly:
+- `ebb.impl.sleep` is the one task completed by two different threads — the
+  runtime timer fires it, whoever cancels the process cancels it. The port took
+  the `.cljs` logic, which arbitrates with a plain mutable flag because
+  ClojureScript has one thread. **12 of 20 interleavings complete it twice.**
+  This was an ADR-001 rule 1 violation: `.cljs` logic without `Sleep.java`'s
+  synchronisation, which arbitrates under the scheduler lock.
+- A doubly-completed task resumes its process twice. `ebb.impl.affine` kept the
+  driver's gate in a single cell, and `deliver` on a realized promise is a
+  no-op, so two resumers install two gates but produce one wake-up. **Every
+  schedule strands a resumer** on a gate nobody opens — and a stranded resumer
+  is a blocked carrier.
 
-- **The hang is a race that parallelism exposes.** It never happens on one or
-  two carriers and is near-certain on eight or more. So it is a data race in
-  code that runs concurrently — the CAS ports, or the cancellation wind-down —
-  and *not* carrier starvation, which was the previous theory here and predicted
-  the opposite slope.
-- **The timeouts are throughput**, worst when parallelism is scarcest. Three
-  tests (`semaphore`, `rendezvous`, `mailbox`) run 100 `sp` processes
-  hot-looping on a port under an inner `(m/timeout ... 100)`, inside a task the
-  harness cancels at 150ms and fails at 200ms. On one carrier that simply does
-  not fit.
+`Sleep` now claims completion under a lock, and the gate is a drained queue
+rather than an overwritten cell. Hangs at 16 carriers went from 6/6 to **0 of
+15**.
 
-The default of 4 sits at the crossover, which is why it presents as
-"occasionally one or the other".
+### What remains is arithmetic, not flakiness
 
-### Wind-down cost
-
-Measured as the delay between the inner 100ms timeout firing and the join of
-the 100 processes settling, three runs each:
+`semaphore`, `rendezvous` and `mailbox` each run 100 `sp` processes hot-looping
+on a port under an inner `(m/timeout ... 100)`, inside a task the harness fails
+at 200ms. Wind-down after the inner timeout fires:
 
 | Shape | Wind-down |
 |---|---|
-| 100 hot processes, plain `sleep 0`, nothing compelled | 30-40 ms |
-| `holding` a 7-permit semaphore | 13-29 ms |
-| `compel` + mailbox | 57-83 ms |
-| `compel` + rendezvous | **143-193 ms** |
+| 100 hot processes, plain `sleep 0`, nothing compelled | 43-55 ms |
+| `holding` a 7-permit semaphore | 20-23 ms |
+| `compel` + mailbox | 76-87 ms |
+| `compel` + rendezvous | **120-124 ms** |
 
-`mailbox` over 25 runs: min 56, p50 73, p90 92, max 101 ms.
+100ms of inner phase plus 120ms of wind-down does not fit in 200ms. That is not
+a race; it is a throughput shortfall, and it is why `rendezvous` fails most
+runs. Per process the wind-down is ~1.2ms, against a 27us park — so the cost is
+in the handshake round trip, which is where to look next.
+
+**The timeout rate went UP when the hang was fixed** (from ~2 runs in 15 to
+~12). The likely reason is that the deadlock was masking work: a stranded
+resumer meant a wind-down that never completed and so was never paid for.
+Recorded rather than smoothed over, because it is the kind of thing that looks
+like a regression and is not.
 
 ### Corrections to earlier conclusions here
 
-Three, kept because each one sent the search the wrong way:
+Four, kept because each sent the search the wrong way:
 
 - **"Cancelling 100 `sp` processes takes 1 ms"** measured *parked* processes.
-  Hot-looping ones take 30-40 ms with no `compel` involved.
-- **"The hangs came from concurrent background jobs competing for carriers."**
-  They did not — the hang reproduces on an idle machine, one run at a time.
-- **"Scheduling jitter while 225 tests share four carriers."** The carrier
-  table above refutes this: more carriers makes the hang far worse, not better.
+- **"The hangs came from concurrent background jobs."** They did not.
+- **"Scheduling jitter while tests share four carriers."** Refuted: more
+  carriers made the hang far worse, not better.
+- **"A data race we cannot localise."** It was two, and enumeration found both.
 
-Ruled out by measurement: primitive throughput (a rendezvous handoff is 13.5 us,
-a `(? (sleep 0))` park ~27 us); `compare-and-set!` cost (flat at 0.20 us
-regardless of state size — jolt short-circuits on identity); `Event` identity
-under jolt's value-comparing `compare-and-set!` (`deftype` equality on jolt is
-identity, verified); and process leakage between tests (live process count
-returns to zero after a cancelled task).
+Ruled out by measurement: primitive throughput; `compare-and-set!` cost (flat
+0.20us regardless of state size); `Event` identity under jolt's value-comparing
+CAS (`deftype` equality is identity); process leakage between tests; and the
+`ap`/`cp` prompt registries, which return to zero entries after every test.
 
-Neither budget has been widened. A test far inside its budget that still trips
-is reporting something real.
+Neither budget has been widened.
 
 ## Tests not ported, and why
 
