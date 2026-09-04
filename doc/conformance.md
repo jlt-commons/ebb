@@ -113,11 +113,20 @@ enqueues on the owner rather than resuming inline. `sp` does not.
 
 ## Known defects
 
-The suite is **39 runs in 40 clean, with no hangs**, and the one failure is
-`reactor-delayed` timing out against its 10ms budget — the same case that has
-been the only flake since `ebb-8nq.30`, at the same rate. What remains, and what
-was fixed, is worth stating precisely because most of it was found by
-measurement rather than by reading.
+The suite's only flakes are two tests against 10ms budgets, each failing on a
+single ~10.3ms outlier about once in 400 runs:
+
+| | p50 | p90 | p99 | max | over 10ms |
+|---|---|---|---|---|---|
+| `reactor-delayed` | 5.05ms | 5.46ms | 6.54ms | 10.32ms | 1/400 |
+| `ambiguous-eval-order` | 2.26ms | 2.53ms | 5.10ms | 10.33ms | 1/400 |
+
+Neither has ever produced a wrong value; both are ebb being slow, and the shape
+(a lone outlier against a tight p99) is a GC pause rather than systematic
+slowness. No budget has been widened — `ebb-8nq.40` carries making an `ap` value
+cost less than the ~600µs it currently does. What remains, and what was fixed,
+is worth stating precisely because most of it was found by measurement rather
+than by reading.
 
 ### Fixed
 
@@ -132,6 +141,7 @@ measurement rather than by reading.
 | Every other ported flow operator toggled `busy` unsynchronised | The same lost flip as `reduce` above, unfixed in nine more files (`ebb-8nq.32`). The claim protocol is now `ebb.impl.arbiter`, and `reductions`, `relieve`, `sample`, `buffer` and `group-by` all use it; `eduction` uses the atomic counter `Eduction.java` uses instead of a monitor; `watch`, `observe` and the parts of `sample`/`relieve`/`buffer`/`group-by` a claim cannot reach use `locking` over field updates with every deref and callback outside it; `continuous` and `affine` carry headers saying why their ports need no arbitration at all. Nothing in the suite reproduced any of them, so `test/ebb/stress_test.clj` was written to — its `racing` driver raises the input's next notification from an executor that is already running, released the instant the consumer takes a value, and it fails all five of the old implementations. |
 | `ap`/`cp` notifiers blocked their caller | Every callback ebb handed out was a synchronous `server/call!`, which both protocols forbid: a notifier, a terminator, a canceller and both task continuations *must not block the calling thread* (`ebb-8nq.29`). They are `server/cast!` now — enqueue and return. What blocked the fix was not the runtime but lolcat; see below. |
 | A cast lost when its owner fiber retired | Found by the fix above. A sender read `live`, the owner retired and took its last drain, and only then did the sender enqueue. A `call!` at least hangs its caller; a cast has nobody waiting, so the message just disappeared — a cancel that never happens and a process that never terminates. `ebb.impl.server` now sets `drained` *before* the final drain, so a sender that reads it runs its own message and one that does not has already enqueued for that drain. |
+| `capture-context` scanned a registry on every hop | Not a defect, a cost: it is called five times per `server/call!` — the caller snapshots, the callee installs and restores, the reply snapshots, the answer installs — and each scan walked every carried registry with a native `current-fiber` call and a map lookup per registry. It answers nil for one atom read now (`carried-live`), which is the honest common case: nobody in the process is inside a reactor propagation. Worth ~10% of a hop, and it tightened the tail rather than the median — `reactor-delayed`'s over-budget rate went 4 in 400 to 1 in 400 and its p99 10.1ms to 6.5ms. Measuring this also **refuted** the reason it was looked at: marshalling is ~150µs of `reactor-delayed`'s ~5ms, and the prompt is 2–3µs, so neither is where the time goes. (`ebb-8nq.36`, continued in `ebb-8nq.40`) |
 | `latest` hung the runtime on an input with no value | `m/latest` needs continuous inputs and must report `Uninitialized continuous flow` for one that has none, as `m/sample` reports `Undefined continuous flow`. Given an `ap` it never completed, and took the process with it — a main thread waiting on a promise elsewhere never got its answer either, so `bin/test` had to be killed. One constructor argument: `Latest.java` leaves `ps.step` **null** until `arity == initialized`, and that null is what says "no value yet" — `transfer` reports on it and `ready` drains instead of notifying. Ebb passed the step callback there, so the branch was unreachable and a malformed program went off into the sampling path. (`ebb-8nq.37`) |
 | An error did not end an `ap`'s output | Handing an error downstream ends what an `ap` will deliver: `Ambiguous.java`'s `transfer` nils the notifier and drops head/tail in the same breath as returning it, so branches still in flight are discarded. Ebb delivered the error and carried on, and a consumer that did not cancel saw values arrive *after* `:done`. The suite never noticed because nearly every consumer in it is `m/reduce`, whose transfer catch cancels the input — the `ap` was being killed from outside and the difference never showed. What it does **not** do is force termination: an `ap` whose input has not terminated is not over just because it failed, which is what missionary's own `?>-cancel-with-crash` asserts and what a first attempt at this got wrong. Settled by running a nine-case matrix against missionary b.47 rather than by reading `Ambiguous.java`, whose two `c.done` sites look equivalent from outside. (`ebb-8nq.38`) |
 | `?<` did not interrupt a branch that had forked | `?<` promises that each new value interrupts the branch in flight, and `ebb.impl.ambiguous` kept ONE cancel fn on the switch's own `Choice` — so it reached a task the branch was parked on directly, and nothing else. As soon as the branch forked (any `?>`, any `amb` of two or more forms) the park belonged to a descendant, the switch had no handle on it, and the replaced branch ran on beside its replacement. `Ambiguous.java` recurses over the whole subtree with `walk`/`cancel`; ebb keeps choices in one vector with a `parent` link, so `cut!` is a reverse filter over that — deepest first, since cancelling a flow can re-enter the pump. Every `Choice` records its park's canceller now, not only switches. Debounce, where the park sits directly under the switch, was correct throughout. (`ebb-8nq.34`) |

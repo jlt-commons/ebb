@@ -48,12 +48,18 @@
 
 (defn local-get [reg] (get @reg (context-key)))
 
+(declare carried? note-carried!)
+
 (defn local-set!
   "Set this context's value, or drop the entry when v is nil so contexts that
   come and go do not accumulate."
   [reg v]
-  (let [k (context-key)]
-    (if (nil? v) (swap! reg dissoc k) (swap! reg assoc k v)))
+  (let [k         (context-key)
+        [old _]   (swap-vals! reg (fn [m] (if (nil? v) (dissoc m k) (assoc m k v))))
+        had       (contains? old k)]
+    ;; only this context ever writes its own key, so `had` cannot be stale
+    (when (and (not= had (some? v)) (carried? reg))
+      (note-carried! (if (some? v) 1 -1))))
   v)
 
 ;; ------------------------------------------- context carried across a call
@@ -89,6 +95,29 @@
   the index of each is stable and a snapshot can be a plain vector."
   (atom []))
 
+(def ^:private carried-live
+  "How many carried entries exist anywhere -- across every registry and every
+  context. Zero is the overwhelmingly common case: it means nobody in the
+  process is inside a reactor propagation, which is true of every call ebb makes
+  outside one.
+
+  This exists because `capture-context` is on the hot path and was most of it.
+  Every `call!` runs it five times over -- the caller snapshots, the callee
+  installs and restores, the reply snapshots, the answer installs -- and each
+  scan walked every registry, calling `context-key` (a native `current-fiber`
+  call) and a map lookup per registry. Measured at ~14us of a 27us hop, against
+  a 13us floor for a bare channel round trip between two fibers. One atom read
+  answers the same question when the count is zero."
+  (atom 0))
+
+(defn- carried? [reg]
+  (let [regs @carried
+        n    (count regs)]
+    (loop [i 0]
+      (and (< i n) (or (identical? (nth regs i) reg) (recur (inc i)))))))
+
+(defn- note-carried! [d] (swap! carried-live + d) nil)
+
 (defn carried-local
   "A `context-local` that travels with `ebb.impl.server/call!`."
   []
@@ -99,16 +128,18 @@
 (defn capture-context
   "Snapshot the carried locals for the calling context, or nil when none of
   them is set. That is every call made outside a reactor, which is nearly all
-  of them, so it answers nil without allocating."
+  of them, so it answers nil for the price of one atom read -- see
+  `carried-live`, and do not put a registry scan back on this path."
   []
-  (let [regs @carried
-        n    (count regs)]
-    (when (loop [i 0]
-            (if (< i n)
-              (if (some? (local-get (nth regs i))) true (recur (inc i)))
-              false))
-      (loop [i 0 snap []]
-        (if (< i n) (recur (inc i) (conj snap (local-get (nth regs i)))) snap)))))
+  (when (pos? @carried-live)
+    (let [regs @carried
+          n    (count regs)]
+      (when (loop [i 0]
+              (if (< i n)
+                (if (some? (local-get (nth regs i))) true (recur (inc i)))
+                false))
+        (loop [i 0 snap []]
+          (if (< i n) (recur (inc i) (conj snap (local-get (nth regs i)))) snap))))))
 
 (defn install-context!
   "Make snap the carried context here, answering what was here before so the
