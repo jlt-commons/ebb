@@ -6,6 +6,19 @@
 
 (defn nop [])
 
+(defn report-uncaught!
+  "Last-resort report for a throw with nowhere to go.
+
+  A `cast!` has no reply channel, so a thunk that throws on an owner fiber
+  would otherwise vanish. Missionary's protocols say callbacks must not throw,
+  so reaching here means a bug -- make it loud rather than silent, which is
+  jolt's house rule."
+  [where e]
+  (binding [*out* *err*]
+    (println (str "ebb: uncaught in " where ": " (ex-message e)))
+    (flush))
+  nil)
+
 ;; ------------------------------------------------------------ context-local
 ;;
 ;; Missionary's Java impls keep some state in a ThreadLocal -- Reactor's
