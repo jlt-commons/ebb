@@ -12,12 +12,29 @@
 ;; recomputed belonged to the invalidated continuation, so they are pruned --
 ;; missionary keeps them in rank order in a pairing heap for exactly this, and
 ;; ebb keeps them in creation order and takes the lowest dirty rank.
+;;
+;; ---------------------------------------------------------------------------
+;; ARBITRATION (ADR-001 rule 1). Continuous.java wraps its entry points in
+;; `synchronized (ps)` and Continuous.cljs stands in for that with a `busy`
+;; toggle; this file carries NEITHER, and needs neither, because it is not a
+;; port of that structure at all. A cp owns a fiber (discipline 2), and every
+;; mutable field below -- `live`, `value`, `choices`, `dirty`, `drain`,
+;; `notified`, `sampling`, `ended`, and every field of every Choice -- is
+;; touched only from a thunk passed to `call!`, which is a synchronous
+;; request/reply onto that one fiber. The fiber IS the monitor, and it is the
+;; monitor a locked region could not be: the work it serialises parks, which is
+;; exactly what rule 5 forbids under a counted lock.
+;;
+;; So the audit item for this file (ebb-8nq.32) is discharged by an invariant
+;; rather than by a lock: NOTHING here may read or write a Process or Choice
+;; field except inside `call!`. The two atoms in the file are not arbitration --
+;; `prompts` is a registry keyed by executor, and neither is per-process state.
 (ns ^:no-doc ebb.impl.continuous
   (:require [ebb.impl.prompt :as p]
             [ebb.impl.util :refer [nop cancelled]]
             [ebb.impl.server :as server]))
 
-(declare transfer cancel call! settle! step! register! deregister! current)
+(declare transfer cancel call! cast! settle! step! register! deregister! current)
 
 (def ^:private none ::none)
 
@@ -35,7 +52,7 @@
                   ^:unsynchronized-mutable sampling
                   ^:unsynchronized-mutable ended]
   clojure.lang.IFn
-  (invoke [this] (call! this #(cancel this)) nil)
+  (invoke [this] (cast! this #(cancel this)) nil)
   clojure.lang.IDeref
   (deref [this] (call! this #(transfer this))))
 
@@ -52,6 +69,7 @@
 ;; ------------------------------------------------------------------- plumbing
 
 (defn- call! [^Process ps thunk] (server/call! (.-owner ps) thunk))
+(defn- cast! [^Process ps thunk] (server/cast! (.-owner ps) thunk))
 
 
 (defn- prune!
@@ -104,7 +122,7 @@
             ch         (->Choice k rank nil false false true false none)]
         (set! (.-choices ps) (conj (.-choices ps) ch))
         (set! (.-iterator ch)
-              (flow (fn [] (call! ps (fn []
+              (flow (fn [] (cast! ps (fn []
                                        (if (.-live ch)
                                          (do (set! (.-ready ch) true)
                                              (when (.-established ch)
@@ -113,7 +131,7 @@
                                          ;; the flow protocol requires the transfer
                                          (try @(.-iterator ch) (catch Throwable _ nil)))
                                        (settle! ps))) nil)
-                    (fn [] (call! ps (fn []
+                    (fn [] (cast! ps (fn []
                                        (set! (.-done ch) true)
                                        (settle! ps))) nil)))
         (when-not (.-live ps)

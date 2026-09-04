@@ -98,3 +98,107 @@
      (fn [_] (swap! log conj :succeeded)) (fn [_] nil))
     (swap! log conj :returned)
     (is (= [:body :succeeded :returned] @log))))
+
+;; --------------------------------------------------- notifications off-thread
+
+(defn- offloaded
+  "A flow emitting xs, raising every notification on a FRESH THREAD.
+
+  That is what an `ap` over `via` does to whatever consumes it, and it is the
+  window ebb-8nq.31 lived in: the notifier fires from the flow's own executor
+  while the thread that called the consumer's `run` is still between
+  `(flow n t)` and its first round. The protocol is respected -- one
+  notification, then one transfer, then the next -- so a consumer that loses a
+  flip has lost it to concurrency, not to a malformed flow."
+  [xs]
+  (fn [n t]
+    (let [left (atom (seq xs))
+          ping (fn [] (doto (Thread. (fn [] (if (seq @left) (n) (t))))
+                        (.setDaemon true)
+                        (.start))
+                 nil)]
+      (ping)
+      (reify
+        clojure.lang.IFn
+        (invoke [_] nil)
+        clojure.lang.IDeref
+        (deref [_] (let [x (first @left)] (swap! left rest) (ping) x))))))
+
+(deftest reduce-does-not-lose-a-notification-raised-off-thread
+  ;; ebb-8nq.31. `(set! busy (not busy))` is a read and a write, so a
+  ;; notification landing from another thread while the starting thread runs
+  ;; its own first round loses one flip. Nothing throws: the reduction simply
+  ;; goes idle while its input sits notified, so this can only be asserted on a
+  ;; deadline.
+  (dotimes [_ 20]
+    (let [n 40
+          p (promise)]
+      ((m/reduce conj [] (offloaded (range n)))
+       (fn [v] (deliver p [:ok v]))
+       (fn [e] (deliver p [:err e])))
+      (is (= [:ok (vec (range n))] (deref p timeout-ms [:err ::timeout]))))))
+
+;; ------------------------------------------------------- concurrent reactors
+
+(defn- delayed-reactor
+  "`reactor-delayed`'s shape, tagged so a reactor that saw another's context
+  would collect the wrong values rather than merely crashing."
+  [tag]
+  (m/reactor
+    (let [r  (atom [])
+          i1 (m/stream! (m/ap (m/? (m/sleep 2 [tag 1]))))
+          i2 (m/stream! (m/ap (m/? (m/sleep 1 [tag 2]))))]
+      (m/stream! (m/zip (partial swap! r conj) i1 i2))
+      r)))
+
+(deftest concurrent-reactors-do-not-share-a-context
+  ;; ebb-8nq.30. `current` and `delayed` were plain global atoms, so a reactor
+  ;; propagating on one fiber was in scope for every other fiber in the process.
+  ;; An event raised elsewhere then took `event`'s in-context branch and read
+  ;; `(.-current ps)` -- which the propagation nils on its way out -- as a null
+  ;; `.-ranks`. Reactor.java keeps both in a ThreadLocal and never has the
+  ;; problem.
+  ;;
+  ;; Each reactor here has two sleeps landing a millisecond apart, so several
+  ;; are always mid-propagation at once. Every one must come back with its own
+  ;; two values and nobody else's.
+  (dotimes [_ 5]
+    (let [n    8
+          outs (mapv (fn [tag]
+                       (let [p (promise)]
+                         ((delayed-reactor tag)
+                          (fn [r] (deliver p [:ok @r]))
+                          (fn [e] (deliver p [:err (ex-message e)])))
+                         p))
+                     (range n))]
+      (dotimes [tag n]
+        (is (= [:ok [[tag 1] [tag 2]]] (deref (nth outs tag) timeout-ms [:err ::timeout])))))))
+
+;; ------------------------------------------------- callbacks that do not block
+
+(deftest a-cancel-cast-at-an-owner-fiber-is-never-lost
+  ;; ebb-8nq.29 made every callback an `ap` hands out a `server/cast!` --
+  ;; enqueue and return, which is what "must not block the calling thread"
+  ;; asks for. Two things that a blocking `call!` had been covering up came out
+  ;; of it, and this shape found both:
+  ;;
+  ;;   * a cast enqueued after the owner fiber took its last drain vanished --
+  ;;     a `call!` at least hangs its caller, a cast has nobody waiting. So
+  ;;     `ebb.impl.server` flags `drained` before that final drain and the
+  ;;     sender runs anything it enqueues afterwards.
+  ;;   * `ebb.impl.propagator` kept ONE global Context where Propagator.java
+  ;;     has a ThreadLocal, so a propagation on the consumer's thread and one
+  ;;     on the ap's owner fiber shared `cursor`. The second was told it was
+  ;;     nested, did not drain `delayed`, and the process waiting there was
+  ;;     never ticked.
+  ;;
+  ;; Both are silent: the reduce simply never completes. 9 runs in 300 before,
+  ;; and only under load, so the count here is what it takes to see it.
+  (let [bad (atom 0)]
+    (dotimes [_ 400]
+      (let [p (promise)]
+        ((m/reduce (fn [_ x] x) nil (m/signal (m/ap (m/? m/never))))
+         (fn [v] (deliver p [:ok v])) (fn [e] (deliver p [:err (ex-message e)])))
+        (let [[tag v] (deref p timeout-ms [:err ::timeout])]
+          (when-not (and (= :err tag) (not= ::timeout v)) (swap! bad inc)))))
+    (is (zero? @bad) "every run must report Uninitialized rather than stall")))

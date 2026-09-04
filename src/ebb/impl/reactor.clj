@@ -30,27 +30,31 @@
 (def error (Object.))
 
 ;;
-;; MUTABLE TOP-LEVEL STATE. The cljs impl uses plain `def` plus `set!`,
-;; which ClojureScript allows and jolt (like Clojure) does not -- `set!`
-;; on a var needs a thread-local binding, and a `binding` is wrong here
-;; anyway. These are atoms instead, read with @ and written with reset!,
-;; which is what missionary's `fiber` global amounts to as well.
-;; Reactor.java holds these in ThreadLocal<Process>; the .cljs impl uses plain
-;; globals, which is the same thing when there is one thread.
+;; WHO IS PROPAGATING, and WHO HAS DELAYED WORK. Reactor.java holds both in a
+;; ThreadLocal<Process>; the .cljs impl uses plain globals, which is the same
+;; thing when there is one thread.
 ;;
-;; EBB HAS TO USE GLOBALS, and it is not an oversight -- making them per-fiber
-;; was tried and broke reactor-double-sub deterministically with "Subscription
-;; failure : not in reactor context." On the JVM a reactor's flows run INLINE on
-;; the propagating thread, so a ThreadLocal is visible to all of them. In ebb an
-;; `ap` or `cp` inside a reactor runs on its OWN owner fiber (ADR-001 discipline
-;; 2), so a fiber-local context is invisible exactly where it is needed.
+;; Ebb ported the globals, and that is wrong in a way that shows: `event` reads
+;; `current` to decide whether it is INSIDE a propagation, and a global answers
+;; yes to every fiber in the process. An event raised from a timer fiber while
+;; some reactor happened to be propagating took the in-context branch and read
+;; `(.-current ps)` -- which the propagation nils on its way out -- as a null
+;; `.-ranks`. That was `reactor-delayed`, at 2 full-suite runs in 50.
 ;;
-;; The right unit is therefore neither the thread nor the fiber but the REACTOR
-;; PROCESS, reaching every fiber that belongs to it. That is ebb-8nq.30. Until
-;; then these stay global, which is sound for one reactor at a time and leaks
-;; between concurrent reactors on different fibers.
-(def current (atom nil))
-(def delayed (atom nil))
+;; Per-fiber was tried next and is also wrong, deterministically: an `ap` or
+;; `cp` inside a reactor runs on its OWN owner fiber (ADR-001 discipline 2), so
+;; the subscription made from that fiber found no context at all
+;; ("Subscription failure : not in reactor context").
+;;
+;; Neither unit is the ThreadLocal's. What the ThreadLocal actually delimits is
+;; the DYNAMIC EXTENT of the propagating call, and ebb's stand-in for that
+;; extent is `ebb.impl.server/call!` -- so these are CARRIED locals
+;; (ebb.impl.util), which travel with the marshalling hop and no further. The
+;; ap pulled by a propagation sees the reactor; the same ap resumed by a timer
+;; does not; a second reactor on another fiber never does. That is the JVM's
+;; behaviour, arrived at the long way round.
+(def ^:private current (u/carried-local))
+(def ^:private delayed (u/carried-local))
 
 (defn lt [x y]
   (if (nil? x)
@@ -96,8 +100,8 @@
     (if-some [sch (.-schedule ps)]
       (set! (.-schedule ps) (link pub sch))
       (do (set! (.-schedule ps) pub)
-          (set! (.-delayed ps) @delayed)
-          (reset! delayed ps)))))
+          (set! (.-delayed ps) (u/local-get delayed))
+          (u/local-set! delayed ps)))))
 
 (defn pull [^Publisher pub]
   (let [ps (.-process pub)
@@ -151,7 +155,7 @@
 
 (defn propagate [^Publisher pub]
   (let [ps (.-process pub)]
-    (reset! current ps)
+    (u/local-set! current ps)
     (loop [pub pub]
       (set! (.-reaction ps) (dequeue pub))
       (set! (.-current ps) pub)
@@ -179,7 +183,7 @@
       (when-some [r (.-reaction ps)]
         (recur r)))
     (set! (.-current ps) nil)
-    (reset! current nil)
+    (u/local-set! current nil)
     (loop []
       (when-some [pub (.-active ps)]
         (set! (.-active ps) (.-active pub))
@@ -224,14 +228,14 @@
   (n) (->Failer t e))
 
 (defn free [^Publisher pub]
-  (when-not (identical? (.-process pub) @current)
+  (when-not (identical? (.-process pub) (u/local-get current))
     (throw (ex-info "Cancellation failure : not in reactor context." {})))
   (cancel pub))
 
 (defn subscribe [^Publisher pub n t]
   (let [ps (.-process pub)
         sub (.-subscriber ps)]
-    (if-not (identical? ps @current)
+    (if-not (identical? ps (u/local-get current))
       (failer n t (ex-info "Subscription failure : not in reactor context." {}))
       (if (identical? sub (.-boot ps))
         (failer n t (ex-info "Subscription failure : not a subscriber." {}))
@@ -245,7 +249,7 @@
 (defn unsubscribe [^Subscription s]
   (let [sub (.-subscriber s)
         ps (.-process sub)]
-    (when-not (identical? ps @current)
+    (when-not (identical? ps (u/local-get current))
       (throw (ex-info "Unsubscription failure : not in reactor context." {})))
     (when-some [pub (.-subscribed s)]
       (set! (.-subscribed s) nil)
@@ -268,7 +272,7 @@
 (defn push [^Subscription s]
   (let [sub (.-subscriber s)
         ps (.-process sub)]
-    (when-not (identical? ps @current)
+    (when-not (identical? ps (u/local-get current))
       (throw (ex-info "Transfer failure : not in reactor context." {})))
     ;; NOT named `value`. A local sharing a name with a mutable deftype field
     ;; reads the FIELD, not the binding, so the snapshot below came back
@@ -346,7 +350,7 @@
             (recur nxt false)))))))
 
 (defn event [^Publisher pub]
-  (if-some [ps @current]
+  (if-some [ps (u/local-get current)]
     (when (set! (.-busy pub) (not (.-busy pub)))
       (if (identical? ps (.-process pub))
         (if (lt (.-ranks (.-current ps)) (.-ranks pub))
@@ -357,8 +361,8 @@
         (schedule pub)))
     (do (propagate-claimed! pub true)
         (loop []
-          (when-some [ps @delayed]
-            (reset! delayed (.-delayed ps))
+          (when-some [ps (u/local-get delayed)]
+            (u/local-set! delayed (.-delayed ps))
             (set! (.-delayed ps) nil)
             (let [pub (.-schedule ps)]
               (set! (.-schedule ps) nil)
@@ -370,7 +374,7 @@
   (reify
     clojure.lang.IDeref
     (deref [_]
-      (let [ps @current]
+      (let [ps (u/local-get current)]
         (when-some [t (.-alive ps)]
           (loop [pub (.-next t)]
             (cancel pub)
@@ -394,7 +398,7 @@
     (event b) ps))
 
 (defn publish [flow continuous]
-  (let [ps (doto @current (-> nil? (when (throw (ex-info "Publication failure : not in reactor context." {})))))
+  (let [ps (doto (u/local-get current) (-> nil? (when (throw (ex-info "Publication failure : not in reactor context." {})))))
         cur (.-subscriber ps)
         pub (->Publisher
               ps nil

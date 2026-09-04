@@ -56,6 +56,74 @@
     (if (nil? v) (swap! reg dissoc k) (swap! reg assoc k v)))
   v)
 
+;; ------------------------------------------- context carried across a call
+;;
+;; Per-fiber is nearly the right unit for the reactor's context, and not quite.
+;; A propagation invokes a subscriber's notifier, and when that subscriber is an
+;; `ap` or a `cp` the notifier is marshalled onto the process's OWN owner fiber
+;; (ADR-001 discipline 2), where a per-fiber read finds nothing -- which is how
+;; the fiber-local attempt broke `reactor-double-sub` with "Subscription failure
+;; : not in reactor context". On the JVM that same notifier runs INLINE on the
+;; propagating thread, so a ThreadLocal reaches it.
+;;
+;; What the ThreadLocal is really giving is the DYNAMIC EXTENT of the call, and
+;; ebb's stand-in for that extent is `ebb.impl.server/call!`. So a local
+;; registered here TRAVELS with the marshalling hop: the caller snapshots it,
+;; the callee installs it for exactly the thunk it was sent with, and puts back
+;; what was there before.
+;;
+;; And it travels BACK. A ThreadLocal is one cell shared by the caller and
+;; everything it calls, so a write made by the callee is a write the caller sees
+;; on return -- which the reactor depends on: `schedule` writes `delayed` from
+;; inside a notifier, and the OUTERMOST `event` is what drains it. Hence the
+;; reply carries the callee's final snapshot; see `server/answer`.
+;;
+;; The distinction that buys is the one the fiber alone cannot make. The same
+;; owner fiber runs an ap both when the reactor pulled it -- in the extent of a
+;; propagation, so in context -- and when a timer resumed it, with no reactor
+;; call above it and therefore out of context. The first must see the reactor,
+;; the second must not, and only the call chain tells them apart.
+
+(def ^:private carried
+  "Registries that travel with `call!`. Registered at load, never removed, so
+  the index of each is stable and a snapshot can be a plain vector."
+  (atom []))
+
+(defn carried-local
+  "A `context-local` that travels with `ebb.impl.server/call!`."
+  []
+  (let [reg (context-local)]
+    (swap! carried conj reg)
+    reg))
+
+(defn capture-context
+  "Snapshot the carried locals for the calling context, or nil when none of
+  them is set. That is every call made outside a reactor, which is nearly all
+  of them, so it answers nil without allocating."
+  []
+  (let [regs @carried
+        n    (count regs)]
+    (when (loop [i 0]
+            (if (< i n)
+              (if (some? (local-get (nth regs i))) true (recur (inc i)))
+              false))
+      (loop [i 0 snap []]
+        (if (< i n) (recur (inc i) (conj snap (local-get (nth regs i)))) snap)))))
+
+(defn install-context!
+  "Make snap the carried context here, answering what was here before so the
+  caller can put it back. nil means \"nothing set\", in both directions."
+  [snap]
+  (let [was (capture-context)]
+    (when (or snap was)
+      (let [regs @carried
+            n    (count regs)]
+        (loop [i 0]
+          (when (< i n)
+            (local-set! (nth regs i) (when snap (nth snap i)))
+            (recur (inc i))))))
+    was))
+
 ;; ---------------------------------------------------- batched process starts
 ;;
 ;; Starting an `sp` blocks the caller until the body reaches its first park --
@@ -112,11 +180,20 @@
   resumes a process, and that resumption waits for the process to reach its next
   park (ADR-001 discipline 2). A hundred concurrent sleeps then serialise
   through one thread and everything downstream times out -- which is exactly how
-  this was found, as 17 tests that pass alone timing out when run together."
+  this was found, as 17 tests that pass alone timing out when run together.
+
+  The fiber is also the containment missionary's #81 lacks. There the callback's
+  throw reached the one scheduler thread and killed it, and every later sleep in
+  the process deadlocked. Here it can only kill the fiber it was raised on -- but
+  it is still reported by name rather than left to the runtime's default handler,
+  because a throw out of a timer callback means a consumer callback violated its
+  \"must not throw\" clause and that should be legible, not a bare trace."
   [ms f]
   ;; fiber-execute, not fibers/spawn: this is fire-and-forget, and spawn also
   ;; builds a handle and completion machinery nobody reads. It is on the hot
   ;; path -- every sleep in the system lands here.
   (timer-at! (+ (System/currentTimeMillis) ms)
-             (fn [] (a/fiber-execute f) nil))
+             (fn [] (a/fiber-execute
+                      (fn [] (try (f) (catch Throwable e (report-uncaught! "timer callback" e)))))
+               nil))
   nil)

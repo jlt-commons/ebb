@@ -19,10 +19,8 @@
 ;;   both wait forever
 ;;
 ;; Erlang has the same hazard and normally answers it by not letting servers
-;; call each other synchronously. Ebb cannot take that way out: the transfer
-;; direction has to be synchronous (it returns the value) and the notify
-;; direction has to be synchronous too (missionary's protocol, and lolcat, both
-;; depend on a notification having been delivered before the notifier returns).
+;; call each other synchronously. Ebb cannot take that way out for the TRANSFER
+;; direction: a transfer returns the value, so the caller has to wait for it.
 ;;
 ;; So the server is REENTRANT: a call made from an owner fiber keeps serving
 ;; that fiber's own inbox while it waits for its reply. The owner is then never
@@ -31,29 +29,35 @@
 ;; fiber, which is precisely where outer's continuations live.
 ;;
 ;; ---------------------------------------------------------------------------
-;; A known protocol violation, and why it is still here (ebb-8nq.29)
+;; call! and cast!, and which callback gets which (ebb-8nq.29)
 ;;
-;; Every call! made from a callback ebb hands OUT blocks that callback's caller,
-;; and both specs forbid it: a notifier and a terminator "must not block", and
-;; so must a canceller and both task continuations. Missionary gets the ordering
-;; those callbacks appear to have by running everything INLINE on the caller's
-;; thread -- work, not waiting. Ebb cannot: resuming an ap or cp continuation is
-;; bound to the owner fiber, so the choice is to block or to deliver later.
+;; The other direction does NOT have to be synchronous, and must not be. A
+;; notifier and a terminator "must not block", and neither may a canceller or
+;; either task continuation -- so every callback ebb hands OUT is a `cast!`,
+;; enqueue-and-return, and only the transfer and the initial start are `call!`.
 ;;
-;; Delivering later was measured, and it costs more than it is worth today: 9 of
-;; missionary's own ap_test and cp_test cases fail, because lolcat is a
-;; synchronous DSL -- `event` mutates one global context during a call, with no
-;; waiting and no thread safety -- so "the notification arrives a moment later"
-;; is not expressible in it. Even making only the canceller asynchronous breaks
-;; three. Fixing this properly means adapting or replacing lolcat, which is
-;; missionary's test DSL carried over verbatim.
+;; This was blocked for a while on the test suite rather than on the runtime.
+;; Missionary gets the ordering those callbacks appear to have by running
+;; everything INLINE on the caller's thread, and lolcat -- missionary's own DSL,
+;; which 30 of its 33 test namespaces are written in -- bakes that in: a `call`
+;; required every event it declared to have been raised BEFORE the call
+;; returned, so "the notification arrives a moment later" could not be written
+;; down. Casting all four callbacks failed 9 of missionary's ap and cp cases for
+;; that reason alone. lolcat now waits for the events a call declared instead of
+;; failing on the spot (see test/lolcat/core.clj), which is a relaxation of WHEN,
+;; not of what or in what order, and 8 of those 9 came back.
 ;;
-;; The mailbox below is UNBOUNDED regardless. That is not for a future cast!:
-;; it is a bug fix. offer! on a full channel returns false exactly as it does on
-;; a closed one, and the old code read both as "retired" and ran the thunk
-;; INLINE on the caller -- resuming a continuation off its owner fiber, which
-;; jolt.continuations documents as a hang with no error. A `live` flag now says
-;; retired, and the queue cannot fill.
+;; The ninth was real, and `cast!` still handles it synchronously: a caller with
+;; ambient context in scope -- the reactor, ebb's stand-in for missionary's
+;; ThreadLocal -- needs the callee's writes back, and a cast has nothing to
+;; bring them back in. See `cast!`.
+;;
+;; The mailbox below is UNBOUNDED. That was a bug fix before it was a
+;; prerequisite for cast!: offer! on a full channel returns false exactly as it
+;; does on a closed one, and the old code read both as "retired" and ran the
+;; thunk INLINE on the caller -- resuming a continuation off its owner fiber,
+;; which jolt.continuations documents as a hang with no error. A `live` flag now
+;; says retired, and the queue cannot fill.
 (ns ^:no-doc ebb.impl.server
   (:require [ebb.impl.prompt :as p]
             [ebb.impl.util :as u]
@@ -65,25 +69,52 @@
 
 (defn- serve-one!
   "Run one message. reply is nil for a cast, which wants no answer -- and whose
-  throw must not be swallowed into a channel nobody reads."
-  [[thunk reply]]
-  (if (nil? reply)
-    (try (thunk) (catch Throwable e (u/report-uncaught! "ap/cp owner" e)))
-    (a/offer! reply (try [::ok (thunk)] (catch Throwable e [::err e]))))
+  throw must not be swallowed into a channel nobody reads.
+
+  The message carries its sender's ambient context (ebb.impl.util's carried
+  locals -- today, the reactor's `current` and `delayed`), which is installed
+  for exactly this thunk and put back afterwards. That is what makes this hop
+  equivalent to the JVM's inline call: on the JVM the notifier runs on the
+  propagating thread and reads its ThreadLocal, here it runs on the owner fiber
+  and reads what the propagation sent with it. Serving is REENTRANT, so the
+  restore has to be the previous values rather than nil -- a message served
+  while another is waiting for a reply must give that one its context back.
+
+  It travels BOTH ways. A ThreadLocal is one cell shared by the caller and
+  everything it calls, so a write made by the callee is a write the caller sees
+  when it returns -- and the reactor depends on exactly that: `schedule`, run
+  from a notifier deep in a propagation, pushes onto `delayed`, and the
+  OUTERMOST `event` is what drains it afterwards. Carrying the context down but
+  not back leaves that push on the callee's fiber, where nothing drains it, and
+  the reactor simply stops. So the reply carries the callee's final snapshot and
+  `answer` installs it.
+
+  No `finally`: both arms catch Throwable already, so nothing escapes, and a
+  winder here would sit inside every prompt extent started under it."
+  [[thunk reply ctx]]
+  (let [was (u/install-context! ctx)]
+    (if (nil? reply)
+      (try (thunk) (catch Throwable e (u/report-uncaught! "ap/cp owner" e)))
+      (let [r (try [::ok (thunk)] (catch Throwable e [::err e]))]
+        (a/offer! reply (conj r (u/capture-context)))))
+    (u/install-context! was))
   nil)
 
-(defn- answer [[tag v]]
+(defn- answer
+  "Unwrap a reply, adopting the context the callee left behind -- unconditional,
+  because a callee that CLEARED the context (a propagation ending, say) has to
+  clear it here too."
+  [[tag v ctx]]
+  (u/install-context! ctx)
   (if (= ::ok tag) v (throw v)))
 
-(deftype Owner [queue signal ^:unsynchronized-mutable id ^:unsynchronized-mutable live])
-
-(defn- push!
-  "Enqueue a message and wake the owner. Never blocks and never drops: the queue
-  is unbounded and the channel carries only a nudge."
-  [^Owner o msg]
-  (swap! (.-queue o) conj msg)
-  (a/offer! (.-signal o) true)
-  nil)
+(deftype Owner [queue signal
+                ^:unsynchronized-mutable id
+                ;; live  -- retire! has not been called
+                ;; drained -- the fiber has stopped taking work, so anything
+                ;;            enqueued from here on is the sender's to run
+                ^:unsynchronized-mutable live
+                ^:unsynchronized-mutable drained])
 
 (defn- drain!
   "Take every queued message, or nil when there are none."
@@ -91,12 +122,33 @@
   (let [[old _] (swap-vals! (.-queue o) empty)]
     (seq old)))
 
+(defn- push!
+  "Enqueue a message and wake the owner. Never blocks and never drops: the queue
+  is unbounded and the channel carries only a nudge.
+
+  The `drained` check is what keeps a CAST from being lost. A sender reads
+  `live`, the owner retires and takes its last drain, and only then does the
+  sender enqueue -- for a `call!` that shows up as a reply that never comes, but
+  a cast has nobody waiting, so the message just disappears. That is a cancel
+  that never happens and a process that never terminates: 9 runs in 300 of
+  `(m/reduce f nil (m/signal (m/ap (m/? m/never))))` hung on exactly this.
+
+  The owner sets `drained` BEFORE its final drain, so the two orderings are both
+  safe: reading false means the final drain is still ahead of us and will take
+  our message, and reading true means we run it ourselves. `drain!` is one
+  atomic swap, so only one side ever gets a given message."
+  [^Owner o msg]
+  (swap! (.-queue o) conj msg)
+  (a/offer! (.-signal o) true)
+  (when (.-drained o) (run! serve-one! (drain! o)))
+  nil)
+
 (defn owner-id [^Owner o] (.-id o))
 
 (defn spawn
   "Start an owner fiber. Returns once it is serving."
   []
-  (let [o     (->Owner (atom []) (a/chan (a/sliding-buffer 1)) nil true)
+  (let [o     (->Owner (atom []) (a/chan (a/sliding-buffer 1)) nil true false)
         ready (promise)]
     (fib/spawn
       (fn []
@@ -109,7 +161,10 @@
             (when (.-live o)
               (when (some? (a/<!! (.-signal o)))
                 (recur))))
-          ;; retired: serve whatever arrived before the close
+          ;; retired. Flag first, drain second: a sender that reads the flag
+          ;; after we set it runs its own message, and one that reads it before
+          ;; has already enqueued for the drain below.
+          (set! (.-drained o) true)
           (run! serve-one! (drain! o))
           (swap! inboxes dissoc me))))
     (deref ready)
@@ -132,7 +187,7 @@
       (if-not (.-live o)
         (thunk)                                 ; retired: nothing left to serialise
         (let [reply (a/promise-chan)]
-          (push! o [thunk reply])
+          (push! o [thunk reply (u/capture-context)])
           (if-some [^Owner mine (get @inboxes me)]
             ;; we are an owner ourselves -- keep serving our own callers while
             ;; we wait, or a mutual call deadlocks (see the header)
@@ -146,3 +201,33 @@
                   (nil? v) (do (run! serve-one! (drain! mine)) (answer (a/<!! reply)))
                   :else (recur))))
             (answer (a/<!! reply))))))))
+
+
+(defn cast!
+  "Hand thunk to o's fiber and RETURN AT ONCE, without waiting for it to run.
+
+  This is Erlang's `!` to `call!`'s `gen_server:call`, and it is what the flow
+  and task protocols actually ask for of the callbacks a process hands out: a
+  notifier, a terminator, a canceller and both task continuations `must not
+  block the calling thread`. `call!` blocks all of them (ebb-8nq.29).
+
+  Three cases still run synchronously, and each is exact rather than cautious:
+
+  * already on o's fiber -- the hop is a no-op either way;
+  * o retired -- there is no fiber left to serialise against;
+  * the caller has AMBIENT CONTEXT in scope. That is the reactor, and it is the
+    one thing a cast cannot express. A carried local stands in for missionary's
+    ThreadLocal, which is one cell shared by a caller and everything it calls,
+    so a write the callee makes is a write the caller must see on return --
+    `schedule` pushes onto `delayed` from inside a notifier and the OUTERMOST
+    `event` drains it. A cast has no reply to put that snapshot in, and worse,
+    it runs the thunk against a snapshot of a propagation that may already have
+    been torn down. So inside a reactor the hop goes back to being synchronous.
+    Nothing else in ebb registers a carried local, so nothing else pays."
+  [^Owner o thunk]
+  (if (or (= (.-id o) (p/here)) (not (.-live o)))
+    (thunk)
+    (if-some [ctx (u/capture-context)]
+      (call! o thunk)
+      (push! o [thunk nil nil])))
+  nil)

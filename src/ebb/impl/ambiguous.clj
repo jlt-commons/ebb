@@ -24,7 +24,7 @@
             [ebb.impl.util :refer [nop cancelled]]
             [ebb.impl.server :as server]))
 
-(declare pump! settle! cancel transfer step! handle! call! switch? register! deregister! current)
+(declare pump! settle! cancel transfer step! handle! call! cast! switch? register! deregister! current)
 
 ;; Two counters, each with one job:
 ;;
@@ -47,7 +47,7 @@
                   ^:unsynchronized-mutable parks
                   ^:unsynchronized-mutable ended]
   clojure.lang.IFn
-  (invoke [this] (call! this #(cancel this)) nil)
+  (invoke [this] (cast! this #(cancel this)) nil)
   clojure.lang.IDeref
   (deref [this] (call! this #(transfer this))))
 
@@ -100,7 +100,7 @@
         ::park
         (let [fired (volatile! false)
               done! (fn [answer]
-                      (call! ps (fn []
+                      (cast! ps (fn []
                                   (when-not @fired
                                     (vreset! fired true)
                                     (handle! ps owner
@@ -118,10 +118,10 @@
             (let [ch (->Choice k owner nil (if (number? a) a 1) 0 0 false true false false nil)]
               (set! (.-choices ps) (conj (.-choices ps) ch))
               (set! (.-iterator ch)
-                    (b (fn [] (call! ps (fn []
+                    (b (fn [] (cast! ps (fn []
                                           (set! (.-avail ch) (inc (.-avail ch)))
                                           (when (.-armed ch) (pump! ps)))) nil)
-                       (fn [] (call! ps (fn []
+                       (fn [] (cast! ps (fn []
                                           (set! (.-done ch) true)
                                           (when (.-armed ch) (pump! ps)))) nil)))
               (set! (.-armed ch) true)
@@ -269,6 +269,7 @@
 (defn fork [par f] (answer (p/suspend (current) [::fork par f])))
 
 (defn- call! [^Process ps thunk] (server/call! (.-owner ps) thunk))
+(defn- cast! [^Process ps thunk] (server/cast! (.-owner ps) thunk))
 
 
 (defn- step!
