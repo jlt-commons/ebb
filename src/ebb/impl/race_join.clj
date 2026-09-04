@@ -17,7 +17,8 @@
 ;; The -2 -> -1 CAS at the end of `run` is what makes cancellation safe when a
 ;; child completes synchronously during spawning: the winner sees -2, cannot
 ;; cancel siblings that do not exist yet, and `run` cancels on its behalf.
-(ns ^:no-doc ebb.impl.race-join)
+(ns ^:no-doc ebb.impl.race-join
+  (:require [ebb.impl.util :as u]))
 
 (deftype Process [combinator joincb racecb children result join race]
   clojure.lang.IFn
@@ -46,8 +47,16 @@
     ;; fiber leaving the CPU while its carrier holds a counted lock
     ;; (host/chez/locks.ss). Missionary loops over an iterator here for its own
     ;; reasons; on jolt it is load-bearing.
-    (loop [index 0 ts (seq ts)]
-      (when ts
+    ;; Children are started inside one batch, so joining N processes costs the
+    ;; slowest first park rather than the sum of all of them (see
+    ;; ebb.impl.util/batch-starts). The wait happens INSIDE the race = -2
+    ;; window, which is exactly what that window is for: a child completing
+    ;; while its siblings do not yet exist cannot cancel them, and `run`
+    ;; cancels on its behalf below.
+    (u/batch-starts
+     (fn []
+      (loop [index 0 ts (seq ts)]
+       (when ts
         (let [join-cb (fn [x]
                         (aset (.-result ps) index x)
                         (terminated ps)
@@ -63,6 +72,6 @@
           (aset (.-children ps) index
                 ((first ts) (if r race-cb join-cb)
                             (if r join-cb race-cb))))
-        (recur (inc index) (next ts))))
+        (recur (inc index) (next ts)))))) 
     (when-not (compare-and-set! (.-race ps) -2 -1) (cancel ps))
     ps))

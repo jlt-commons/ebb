@@ -5,6 +5,38 @@
 
 (defn nop [])
 
+;; ---------------------------------------------------- batched process starts
+;;
+;; Starting an `sp` blocks the caller until the body reaches its first park --
+;; that is missionary's ordering, and its own tests assert it. Missionary pays
+;; nothing for it because the body runs INLINE on the caller's thread. Ebb's
+;; bodies own their own fiber, so the same ordering costs a scheduling round
+;; trip: 19us on an idle runtime, but 285us once the carriers are saturated.
+;;
+;; A combinator that starts N children in series therefore pays the SUM of
+;; those round trips. Joining 100 processes cost ~100ms, which is most of the
+;; rendezvous test's 200ms budget, and left the spawn loop uninterruptible for
+;; the duration.
+;;
+;; The waits do not have to be serial. `batch-starts` collects them instead: a
+;; combinator starts every child, then waits for all of them together, so the
+;; cost is the SLOWEST first park rather than the total. The observable
+;; contract is unchanged -- the combinator still returns only once every child
+;; has reached its first park.
+
+(def ^:dynamic *starting*
+  "An atom collecting the gates of processes started under `batch-starts`, or
+  nil when starts should wait individually."
+  nil)
+
+(defn batch-starts
+  "Call (f), deferring the wait of every process started during it, then wait
+  for them all. Returns f's value."
+  [f]
+  (let [collected (atom [])]
+    (try (binding [*starting* collected] (f))
+         (finally (run! deref @collected)))))
+
 (defn cancelled
   "ebb's cancellation signal. missionary uses a dedicated `missionary.Cancelled`
   class; jolt has no user classes, so it is an ex-info carrying ::cancelled."

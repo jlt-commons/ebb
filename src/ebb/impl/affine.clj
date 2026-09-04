@@ -68,7 +68,7 @@
 ;; non-zero count on ENTRY means the caller is at fault, not the parking code.
 (ns ^:no-doc ebb.impl.affine
   (:require [jolt.fibers :as fib]
-            [ebb.impl.util :refer [nop cancelled]]))
+            [ebb.impl.util :as u :refer [nop cancelled]]))
 
 ;; gate  -- promises of every driver waiting for the body to reach its next
 ;;          park. A VECTOR, not a single cell. It was a single cell, and
@@ -226,8 +226,13 @@
     (set! (.-fiber ps)
           (fib/spawn
             (fn []
-              (binding [*process* ps]
+              ;; *starting* is rebound to nil inside the fiber: a child that
+              ;; starts processes of its own must not enrol them in the
+              ;; parent's batch.
+              (binding [*process* ps, u/*starting* nil]
                 (try (f)
                      (finally (finish! ps)))))))
-    (deref g)
+    (if-some [collected u/*starting*]
+      (swap! collected conj g)     ; the batch will wait for us
+      (deref g))
     ps))
