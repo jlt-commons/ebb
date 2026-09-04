@@ -1,41 +1,55 @@
-#!/usr/bin/env python3
-"""Port a missionary test namespace to ebb.
+#!/usr/bin/env jolt
+;; Port a missionary test namespace to ebb.
+;;
+;; Mechanical only: renames the namespace, repoints missionary.core at ebb.core,
+;; drops the `missionary.Cancelled` import (ebb signals cancellation with an
+;; ex-info, so there is no class to import) and rewrites the predicate that used
+;; it. Anything else that needs changing is a real porting decision and should
+;; be made by hand, in the file, with a comment saying why.
+;;
+;;   bin/port-test zip latest        # -> test/ebb/zip_test.clj, latest_test.clj
 
-Mechanical only: renames the namespace, repoints missionary.core at ebb.core,
-drops the `missionary.Cancelled` import (ebb signals cancellation with an
-ex-info, so there is no class to import) and rewrites the predicate that used
-it. Anything else that needs changing is a real porting decision and should be
-made by hand, in the file, with a comment saying why.
-"""
-import re, sys, pathlib
+(require '[clojure.string :as str] '[jolt.fs :as fs])
 
-SRC = pathlib.Path("/home/yogthos/src/missionary/test/missionary")
-DST = pathlib.Path("test/ebb")
+(def src-dir "/home/yogthos/src/missionary/test/missionary")
+(def dst-dir "test/ebb")
 
-def port(name):
-    src = SRC / f"{name}_test.cljc"
-    if not src.exists():
-        src = SRC / f"{name}_test.clj"
-    s = src.read_text()
+(defn- drop-cancelled-import
+  "Remove the (:import [missionary Cancelled]) clause. When it is the LAST clause
+  in the ns form it takes the form's closing paren with it, so that case has to
+  put one back."
+  [s]
+  (let [closing (str/replace s #"\n\s*\(:import [\[(]missionary Cancelled[\])]\)\)" ")")]
+    (if (not= closing s)
+      closing
+      (str/replace s #"\n\s*\(:import [\[(]missionary Cancelled[\])]\)" ""))))
 
-    # drop the Cancelled import and re-close the ns form it was closing
-    s, n = re.subn(r"\n\s*\(:import [\[(]missionary Cancelled[\])]\)\)", ")", s)
-    if not n:
-        s = re.sub(r"\n\s*\(:import [\[(]missionary Cancelled[\])]\)", "", s)
+(defn port [name]
+  (let [cljc (str src-dir "/" name "_test.cljc")
+        src  (if (fs/exists? cljc) cljc (str src-dir "/" name "_test.clj"))
+        out  (str dst-dir "/" name "_test.clj")]
+    (if-not (fs/exists? src)
+      (println (str "  !! " name ": no such missionary test namespace"))
+      (let [ported (as-> (slurp src) s
+                     (drop-cancelled-import s)
+                     (str/replace s "missionary.core" "ebb.core")
+                     (str/replace s #"\bmissionary\.([a-z0-9_-]+)-test\b" "ebb.$1-test")
+                     (str/replace s "(partial instance? Cancelled)" "m/cancelled?")
+                     (str/replace s "(partial instance? missionary.Cancelled)" "m/cancelled?"))]
+        (when (str/includes? ported "Cancelled")
+          (binding [*out* *err*]
+            (println (str "  !! " name ": 'Cancelled' still present, needs a hand edit"))))
+        (spit out (str ";; Ported from missionary test/missionary/"
+                       (subs src (inc (count src-dir))) " (EPL 2.0).\n"
+                       ";; Mechanical port: missionary.core -> ebb.core, and the\n"
+                       ";; missionary.Cancelled import/predicate -> ebb's m/cancelled?.\n"
+                       ported))
+        (println (str "  ported " name " -> " out))))))
 
-    s = s.replace("missionary.core", "ebb.core")
-    s = re.sub(r"\bmissionary\.([a-z0-9_-]+)-test\b", r"ebb.\1-test", s)
-    s = s.replace("(partial instance? Cancelled)", "m/cancelled?")
-    s = s.replace("(partial instance? missionary.Cancelled)", "m/cancelled?")
+(when-not (fs/exists? src-dir)
+  (println (str "missionary sources not found at " src-dir))
+  (System/exit 1))
 
-    if "Cancelled" in s:
-        print(f"  !! {name}: 'Cancelled' still present, needs a hand edit", file=sys.stderr)
-
-    hdr = (f";; Ported from missionary test/missionary/{src.name} (EPL 2.0).\n"
-           f";; Mechanical port: missionary.core -> ebb.core, and the\n"
-           f";; missionary.Cancelled import/predicate -> ebb's m/cancelled?.\n")
-    (DST / f"{name}_test.clj").write_text(hdr + s)
-    print(f"  ported {name}")
-
-for name in sys.argv[1:]:
-    port(name)
+(if-let [args (seq *command-line-args*)]
+  (doseq [n args] (port n))
+  (println "usage: bin/port-test <namespace> ...   (e.g. zip latest)"))

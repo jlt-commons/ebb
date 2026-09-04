@@ -23,33 +23,39 @@
               (l/check m/cancelled?))))))
 
 (defn interrupt-current!
-  "PORT DIVERGENCE. Missionary interrupts the calling thread here, because its
-  JVM Observe consults the interrupt flag. Ebb's Observe is ported from the
-  .cljs impl and detects overflow structurally -- the consumer either holds an
-  untransferred value or it does not -- so the interrupt is not part of what is
-  under test.
+  "Interrupt the calling thread, exactly as missionary's does. jolt implements
+  the JVM interrupt protocol -- `.interrupt`, `.isInterrupted`,
+  `Thread/interrupted` and an `InterruptedException` out of a blocking wait --
+  so this is the real thing.
 
-  It is also actively harmful on jolt: the flag survives the test and the next
-  `promise` deref on this thread, in an unrelated namespace, dies with
-  InterruptedException. That cost a bisect. Left as a no-op so the lolcat
-  program keeps its shape."
+  What is under test is that an interrupted producer still gets Observe's
+  structural overflow error rather than an interrupt-flavoured one."
   []
+  (.interrupt (Thread/currentThread))
   nil)
 
 (t/deftest overflow
-  (t/is (= []
-          (lc/run
-            (l/store
-              (m/observe lc/event)
-              (l/spawn :main
-                (l/compose
-                  (l/insert :f)
-                  #(do)))
-              (l/signal :f :x (l/notified :main))
-              interrupt-current!
-              (lc/call 0)
-              (lc/drop 0)
-              (l/signal-error :f :x))))))
+  (try
+    (t/is (= []
+            (lc/run
+              (l/store
+                (m/observe lc/event)
+                (l/spawn :main
+                  (l/compose
+                    (l/insert :f)
+                    #(do)))
+                (l/signal :f :x (l/notified :main))
+                interrupt-current!
+                (lc/call 0)
+                (lc/drop 0)
+                (l/signal-error :f :x)))))
+    (finally
+      ;; The interrupt flag is thread state, not test state. Left set, it
+      ;; survives this test and the first blocking wait in the NEXT namespace
+      ;; dies with InterruptedException -- which cost a bisect to find.
+      ;; Missionary's JVM suite carries the same hazard and gets away with it on
+      ;; runner ordering; clearing it is cheaper than depending on that.
+      (Thread/interrupted))))
 
 ;; unsubscribe fn is called after cancellation
 ;; we don't know when exactly should the unsubscription happen

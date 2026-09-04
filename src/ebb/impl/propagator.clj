@@ -153,20 +153,22 @@
 (defn terminate [^Context ctx ^Process ps]
   (let [^Publisher pub (.-parent ps)]
     (set! (.-input ps) nil)
-    (when-some [^Subscription ready (.-ready ps)]
+    ;; NOT named `ready` -- see doc/conformance.md: the snapshot would come back
+    ;; as the nil just assigned.
+    (when-some [^Subscription v-ready (.-ready ps)]
       (set! (.-ready ps) nil)
-      (bufferize ctx ready)
-      (clear ready))
+      (bufferize ctx v-ready)
+      (clear v-ready))
     (release pub)))
 
 (defn invalidate [^Context ctx ^Process ps]
   (let [^Publisher pub (.-parent ps)]
     (set! (.-dirty ps) true)
-    (when-some [^Subscription ready (.-ready ps)]
+    (when-some [^Subscription v-ready (.-ready ps)]
       (set! (.-ready ps) nil)
-      (bufferize ctx ready)
+      (bufferize ctx v-ready)
       (union (.-pending ps)
-        (set! (.-pending ps) ready)))
+        (set! (.-pending ps) v-ready)))
     (release pub)))
 
 (defn step-all [^Process ps]

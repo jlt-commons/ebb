@@ -24,18 +24,19 @@ jolt's Chez Scheme runtime, on fibers.
 ;=> [1 1 2 2 3 3]
 ```
 
-**Status: feature-complete, with one open defect.** Every missionary
-implementation in scope is ported — the three process primitives (`sp`, `ap`,
-`cp`), the propagator and reactor, and every port and flow operator. Ebb runs
-**missionary's own test namespaces**, edited only where
-[doc/conformance.md](doc/conformance.md) says so: **225 tests, 265 assertions**.
+**Status: feature-complete, with one open defect.** Every public var of
+missionary's API is ported — the three process primitives (`sp`, `ap`, `cp`),
+the propagator and reactor, every port and flow operator, `via`/`blk`/`cpu`,
+and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
+edited only where [doc/conformance.md](doc/conformance.md) says so: **238
+tests, 278 assertions**.
 
-The defect is cancellation wind-down. Three tests cancel 100 hot-looping
-processes at once; that takes 30–40ms even with nothing compelled, and up to
-193ms through a compelled rendezvous, against budgets that assume far less.
-About one run in ten of `ebb.core-test` does not merely overrun but **hangs**,
-spinning every carrier. Measurements and what they rule out are in
-[doc/conformance.md](doc/conformance.md#known-defect-the-suite-can-hang-and-three-tests-overrun-their-budgets);
+The defect is in `ebb.core-test`: on the default 4 carriers about 1 run in 5
+fails and 1 in 7 hangs. It is **two** problems — a data race that more
+parallelism makes worse (near-certain on 8+ carriers, never seen on 1–2), and a
+throughput shortfall in three tests that cancel 100 hot-looping processes at
+once. The evidence, including the carrier-count table that separates them, is
+in [doc/conformance.md](doc/conformance.md#known-defects-a-parallelism-race-and-three-tests-that-overrun);
 the bug is `ebb-8nq.23`. Do not treat ebb as production-ready until it is
 closed.
 
@@ -78,8 +79,14 @@ Missionary code keeps working here; ebb code may not port back.
 ebb throws an `ex-info`. Test it with `m/cancelled?`, not `instance?`. This is
 the only edit most ported tests needed.
 
-Deliberately absent: `via`/`blk`/`cpu` (JVM executors — jolt has fibers, and `?`
-parks anywhere) and `publisher`/`subscribe` (Reactive Streams, out of scope).
+**Reactive Streams is a protocol, not a Java interface.** `publisher` returns
+something implementing `ebb.rs/Publisher` rather than
+`org.reactivestreams.Publisher` — same three roles, same contract, stated in
+Clojure because jolt has no Java interfaces. Missionary's own `pub_test` and
+`sub_test` run against it with only the interface names swapped.
+
+Nothing else is missing: `via`/`via-call`/`blk`/`cpu` are present too, and
+cancellation really does interrupt the evaluating thread.
 
 ## Tests
 
@@ -101,6 +108,8 @@ of missionary's sources, warning on the constructs that need a human.
   and why it is shaped this way. Five rules, each one earned by a bug.
 - [doc/evaluation.md](doc/evaluation.md) — the feasibility study the port was
   built on, with its wrong turns corrected inline.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, test and port; the
+  conventions a change is expected to follow.
 
 ## Why "ebb"
 

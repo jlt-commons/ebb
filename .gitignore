@@ -3,7 +3,18 @@
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
+
+# Agent tooling and local issue tracking: useful on a working copy, not part of
+# the library. .beads carries a 6MB Dolt database of issue history -- kept on
+# disk, just not published here.
+.beads/
+.agents/
+.claude/
+.codex/
 
 # jolt's per-project dependency cache
 .jolt/cpcache/
+
+# Agent instruction files: kept on a working copy, not published here.
+AGENTS.md
+CLAUDE.md

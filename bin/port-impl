@@ -1,47 +1,74 @@
-#!/usr/bin/env python3
-"""Port a missionary .cljs impl to ebb.
+#!/usr/bin/env jolt
+;; Port a missionary .cljs impl to ebb.
+;;
+;; Mechanical translation only. Deftype field mutability, the sync strategy from
+;; the .java counterpart, and anything host-specific are left for a hand pass --
+;; this just removes the ClojureScript.
+;;
+;;   bin/port-impl Zip:zip Latest:latest      # Camel.cljs -> src/ebb/impl/x.clj
 
-Mechanical translation only. Deftype field mutability, the sync strategy from
-the .java counterpart, and anything host-specific are left for a hand pass --
-this just removes the ClojureScript.
-"""
-import re, sys, pathlib
+(require '[clojure.string :as str] '[jolt.fs :as fs])
 
-SRC = pathlib.Path("/home/yogthos/src/missionary/src/missionary/impl")
+(def src-dir "/home/yogthos/src/missionary/src/missionary/impl")
 
-def port(camel, target):
-    s = (SRC / f"{camel}.cljs").read_text()
-    ns = "ebb.impl." + target.replace("_", "-")
-    s = re.sub(r"\(ns (\^:no-doc )?missionary\.impl\.\w+", lambda m: f"(ns ^:no-doc {ns}", s)
-    s = s.replace("missionary.impl.PairingHeap", "ebb.impl.pairing-heap")
-    s = s.replace("(:import missionary.Cancelled)", "(:require [ebb.impl.util :refer [cancelled]])")
-    s = re.sub(r"\(Cancelled\. ", "(cancelled ", s)
-    s = s.replace("catch :default", "catch Throwable")
-    s = re.sub(r"\(catch Throwable (\w+)\)", r"(catch Throwable \1 nil)", s)
-    s = re.sub(r"^  IFn$", "  clojure.lang.IFn", s, flags=re.M)
-    s = re.sub(r"^  IDeref$", "  clojure.lang.IDeref", s, flags=re.M)
-    s = s.replace("IFn\n", "clojure.lang.IFn\n").replace("IDeref\n", "clojure.lang.IDeref\n")
-    s = re.sub(r"\(reify IDeref", "(reify clojure.lang.IDeref", s)
-    s = re.sub(r"\(reify IFn", "(reify clojure.lang.IFn", s)
-    s = s.replace("clojure.lang.clojure.lang.", "clojure.lang.")
-    s = re.sub(r"\(-invoke \[", "(invoke [", s)
-    s = re.sub(r"\(-deref \[", "(deref [", s)
-    s = s.replace("(iter ", "(.iterator ")
-    s = s.replace("(js-obj)", "(Object.)")
-    s = re.sub(r'\(js/Error\. ("(?:[^"\\]|\\.)*")\)', r'(ex-info \1 {})', s)
-    s = s.replace("(->MapEntry ", "(clojure.lang.MapEntry. ")
-    s = s.replace("(make-array ", "(object-array ")
-    s = s.replace("(js-mod ", "(mod ")
-    s = re.sub(r"\(== ", "(= ", s)
-    s = re.sub(r"\^number ", "", s)
-    s = re.sub(r"\^boolean ", "", s)
-    s = re.sub(r"\(defn \^boolean ", "(defn ", s)
-    hdr = (f";; Derived from missionary/impl/{camel}.cljs (missionary, EPL 2.0).\n"
-           f";; See {camel}.java for the synchronisation strategy (ADR-001 rule 1).\n")
-    out = pathlib.Path(f"src/ebb/impl/{target}.clj")
-    out.write_text(hdr + s)
-    print(f"  ported {camel} -> {out}")
+(def rewrites
+  "Applied in order. Each is [match replacement] for clojure.string/replace, so
+  a string match is literal and a regex match may use $1 in the replacement."
+  [;; ClojureScript protocol names -> the clojure.lang interfaces jolt uses
+   [#"(?m)^  IFn$"    "  clojure.lang.IFn"]
+   [#"(?m)^  IDeref$" "  clojure.lang.IDeref"]
+   ["IFn\n"           "clojure.lang.IFn\n"]
+   ["IDeref\n"        "clojure.lang.IDeref\n"]
+   [#"\(reify IDeref" "(reify clojure.lang.IDeref"]
+   [#"\(reify IFn"    "(reify clojure.lang.IFn"]
+   ["clojure.lang.clojure.lang." "clojure.lang."]   ; undo double-prefixing
+   [#"\(-invoke \[" "(invoke ["]
+   [#"\(-deref \["  "(deref ["]
 
-for a in sys.argv[1:]:
-    camel, target = a.split(":")
-    port(camel, target)
+   ;; cancellation: missionary.Cancelled is a class, ebb's is an ex-info
+   ["(:import missionary.Cancelled)" "(:require [ebb.impl.util :refer [cancelled]])"]
+   [#"\(Cancelled\. " "(cancelled "]
+
+   ;; exceptions
+   ["catch :default" "catch Throwable"]
+   [#"\(catch Throwable (\w+)\)" "(catch Throwable $1 nil)"]   ; cljs allows an empty body
+   [#"\(js/Error\. (\"(?:[^\"\\\\]|\\\\.)*\")\)" "(ex-info $1 {})"]
+
+   ;; host interop
+   ["(iter "        "(.iterator "]
+   ["(js-obj)"      "(Object.)"]
+   ["(->MapEntry "  "(clojure.lang.MapEntry. "]
+   ["(make-array "  "(object-array "]
+   ["(js-mod "      "(mod "]
+   [#"\(== " "(= "]
+
+   ;; cljs type hints jolt neither needs nor accepts
+   [#"\^number "  ""]
+   [#"\^boolean " ""]
+   [#"\(defn \^boolean " "(defn "]])
+
+(defn port [camel target]
+  (let [ns-name (str "ebb.impl." (str/replace target "_" "-"))
+        out     (str "src/ebb/impl/" target ".clj")
+        ported  (as-> (slurp (str src-dir "/" camel ".cljs")) s
+                  (str/replace s #"\(ns (\^:no-doc )?missionary\.impl\.\w+"
+                               (str "(ns ^:no-doc " ns-name))
+                  (str/replace s "missionary.impl.PairingHeap" "ebb.impl.pairing-heap")
+                  (reduce (fn [s [match replacement]] (str/replace s match replacement))
+                          s rewrites))]
+    (spit out (str ";; Derived from missionary/impl/" camel ".cljs (missionary, EPL 2.0).\n"
+                   ";; See " camel ".java for the synchronisation strategy (ADR-001 rule 1).\n"
+                   ported))
+    (println (str "  ported " camel " -> " out))))
+
+(when-not (fs/exists? src-dir)
+  (println (str "missionary sources not found at " src-dir))
+  (System/exit 1))
+
+(if-let [args (seq *command-line-args*)]
+  (doseq [a args]
+    (let [[camel target] (str/split a #":")]
+      (if (and camel target)
+        (port camel target)
+        (println (str "  skipped " a " -- expected Camel:target_name")))))
+  (println "usage: bin/port-impl Camel:target_name ..."))

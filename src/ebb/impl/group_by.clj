@@ -83,10 +83,11 @@
     (when (set! (.-busy p) (not (.-busy p)))
       (if (.-done p)
         (do (set! (.-live p) false)
-            (when-some [table (.-table p)]
+            ;; NOT named `table` -- see doc/conformance.md.
+            (when-some [v-table (.-table p)]
               (set! (.-table p) nil)
-              (dotimes [i (alength table)]
-                (when-some [g (aget table i)]
+              (dotimes [i (alength v-table)]
+                (when-some [g (aget v-table i)]
                   ((.-terminator g)))))
             ((.-terminator p)))
         (if (identical? p (.-value p))

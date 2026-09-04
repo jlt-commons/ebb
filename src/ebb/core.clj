@@ -33,6 +33,10 @@
             [ebb.impl.sleep :as sleep]
             [ebb.impl.seed :as seed]
             [ebb.impl.reduce :as reduce-impl]
+            [ebb.impl.thunk :as thunk]
+            [ebb.impl.pub :as pub]
+            [ebb.impl.sub :as sub]
+            [ebb.rs :as rs]
             [jolt.fibers :as fib]))
 
 ;; ---------------------------------------------------------------- cancellation
@@ -83,6 +87,46 @@
             (fn [e] (deliver p [:err e]) nil))
       (let [[tag v] (deref p)]
         (if (= :ok tag) v (throw v))))))
+
+(def blk
+  "Executor for blocking calls: an unbounded pool, so a thread parked in a
+  syscall never queues behind another. See `via`."
+  thunk/blk)
+
+(def cpu
+  "Executor for compute: one thread per available processor. See `via`."
+  thunk/cpu)
+
+(defn via-call
+  "Task evaluating (thunk) on the given `java.util.concurrent.Executor` and
+  completing with its result. Cancellation interrupts the evaluating thread."
+  [executor thunk]
+  (fn [s f] (thunk/run executor thunk s f)))
+
+(defmacro via
+  "Task evaluating body on the given executor -- `blk` for calls that block,
+  `cpu` for calls that compute -- and completing with its result. Cancellation
+  interrupts the evaluating thread.
+
+  Most ebb code does not need this: `sp` runs on a fiber and `?` parks at any
+  depth, so a task that merely waits should be a task, not a thread. `via` is
+  for genuinely blocking host calls with no task-shaped equivalent."
+  [executor & body]
+  `(via-call ~executor (fn [] ~@body)))
+
+;; ------------------------------------------------------- reactive streams
+
+(defn publisher
+  "The discrete flow f seen as an `ebb.rs/Publisher`, running f once per
+  subscription. See `ebb.rs` for the protocol."
+  [f]
+  (reify rs/Publisher
+    (subscribe [_ s] (pub/run f s) nil)))
+
+(defn subscribe
+  "An `ebb.rs/Publisher` seen as a discrete flow."
+  [pub]
+  (fn [n t] (sub/run pub n t)))
 
 (defn ^:no-doc run-task
   "Run task to completion, parking (not spinning) while it is pending. Returns

@@ -256,22 +256,28 @@
         ps (.-process sub)]
     (when-not (identical? ps @current)
       (throw (ex-info "Transfer failure : not in reactor context." {})))
-    (let [value (if-some [pub (.-subscribed s)]
-                  (let [value (.-value pub)]
+    ;; NOT named `value`. A local sharing a name with a mutable deftype field
+    ;; reads the FIELD, not the binding, so the snapshot below came back
+    ;; mutated: `ack` sets (.-value pub) to nil once pending reaches zero, and
+    ;; this transfer then returned nil instead of the value it had just read.
+    ;; Only the last acking subscriber hits it, which is why it surfaced as an
+    ;; intermittent reactor failure. See doc/conformance.md.
+    (let [v-val (if-some [pub (.-subscribed s)]
+                  (let [v-cur (.-value pub)]
                     (if (pos? (.-pending pub))
-                      (do (ack pub) value)
-                      (if (identical? value stale)
+                      (do (ack pub) v-cur)
+                      (if (identical? v-cur stale)
                         (do (sample pub) (.-value pub))
-                        value))) error)
-          cur (.-subscriber ps)]
+                        v-cur))) error)
+          cur   (.-subscriber ps)]
       (set! (.-subscriber ps) sub)
-      (if (identical? value error)
+      (if (identical? v-val error)
         (do ((.-terminator s))
             (set! (.-subscriber ps) cur)
             (throw (cancelled "Subscription cancelled.")))
         (do (hook s)
             (set! (.-subscriber ps) cur)
-            value)))))
+            v-val)))))
 
 (defn event [^Publisher pub]
   (if-some [ps @current]

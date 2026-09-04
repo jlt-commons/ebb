@@ -216,9 +216,12 @@
 (defn- cancel [^Process ps]
   (when (.-live ps)
     (set! (.-live ps) false)
-    (let [parks (.-parks ps)]
+    ;; NOT named `parks`: a local sharing a name with a mutable field reads the
+    ;; FIELD, so this snapshot came back as the [] just assigned and every
+    ;; park-cancel was silently skipped. See doc/conformance.md.
+    (let [v-parks (.-parks ps)]
       (set! (.-parks ps) [])
-      (doseq [c parks] (c)))
+      (doseq [c v-parks] (c)))
     (doseq [^Choice ch (.-choices ps)]
       (when (.-live ch)
         (set! (.-live ch) false)

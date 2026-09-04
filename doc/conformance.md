@@ -10,13 +10,25 @@ only where this file says so. That is the evidence behind most of these rows.
 
 ## Deliberately absent
 
-| API | Why |
-|---|---|
-| `via`, `via-call`, `blk`, `cpu` | JVM `Executor`s. Jolt has fibers; `sp` already runs on one, and `?` parks at any depth, so the thing these existed to work around is not present. |
-| `publisher`, `subscribe` | Reactive Streams interop, out of scope for the port. |
-| `Pub`, `Sub`, `Thunk` | Implementation support for the two rows above. |
+Nothing. Every public var of missionary's API is present, including
+`via`/`via-call`/`blk`/`cpu` and `publisher`/`subscribe`.
 
 ## Behavioural differences
+
+**Reactive Streams is a protocol here, not a Java interface.** Missionary's
+`publisher` returns an `org.reactivestreams.Publisher`; jolt has no Java
+interfaces to implement, so ebb states the same three roles as protocols in
+`ebb.rs` — `Publisher`, `Subscriber`, `Subscription`, with the same method
+names and the same contract. The state machines are ports of `Pub.java` and
+`Sub.java`, and missionary's own `pub_test` and `sub_test` run against them
+with only the interface names swapped. Bridging to a real Reactive Streams
+implementation means extending these protocols to it.
+
+**`(subscribe (publisher f))` is not a supported round trip** — in ebb or in
+missionary. `Pub` calls `on-next` synchronously from inside `request`, and
+`Sub` calls `request` from inside `transfer`, so wiring one straight into the
+other re-enters the flow notifier before the pending transfer has returned.
+Each side is correct against a counterparty that does not do this.
 
 **`Cancelled` is a value, not a class.** Missionary throws
 `missionary.Cancelled`; jolt has no user-defined classes, so ebb throws an
@@ -57,79 +69,121 @@ enqueues on the owner rather than resuming inline. `sp` does not.
 
 ## Host differences inherited from jolt
 
+- **A local may not share a name with a mutable `deftype` field.** In some
+  shapes such a local reads the FIELD rather than the binding, so a snapshot
+  taken before a `set!` comes back holding the value that `set!` wrote. The
+  classic missionary idiom
+
+  ```clojure
+  (let [pending (.-pending ps)]     ; snapshot
+    (set! (.-pending ps) nil)       ; clear
+    (doseq [c pending] (c)))        ; ...iterates the CLEARED value
+  ```
+
+  is therefore unsafe as written, and every port must rename the local. This is
+  not universal — small reproductions of the same shape behave correctly, so
+  the trigger is narrower than "any shadowing" and has not been isolated — but
+  it is real, and silent. It cost three ported tests and one intermittent
+  reactor failure before it was found:
+
+  | Where | What it did |
+  |---|---|
+  | `Sub.transfer`/`cancel` | dropped one value per stream, and never cancelled upstream |
+  | `Reactor.transfer` | `ack` nils `.-value` when pending hits zero, so the last acking subscriber transferred `nil` — an intermittent failure, since it depends on ack order |
+  | `Ambiguous.cancel` | iterated the just-emptied park list, so no park-cancel ran |
+  | `Propagator` | bufferized a just-nilled subscription |
+
+  Ebb's convention is to prefix such locals `v-`. Worth reporting upstream; see
+  `ebb-8nq.24`.
+
 - **Strings are codepoint-indexed.** `(count "😀")` is 1.
 - **`compare-and-set!` on an atom compares by value**, where JVM Clojure uses
   reference identity. Harmless for ebb's CAS ports — their states are sets and
   maps of `Event` deftypes, which have identity equality, and no `Event` is
   removed and re-added, so ABA is unreachable. **Any future CAS port over
   value-equal states must check this.**
-- **No thread interruption.** Missionary's `Observe` consults the JVM interrupt
-  flag; ebb's is ported from the `.cljs` impl and detects overflow structurally.
-  `observe_test`'s `interrupt-current!` is a no-op in ebb — left in place so the
-  test keeps its shape, and neutered because the flag otherwise survives the
-  test and kills the next `promise` deref on that thread.
+- ~~**No thread interruption.**~~ **Withdrawn — this was wrong.** jolt
+  implements the JVM interrupt protocol in full: `.interrupt`,
+  `.isInterrupted`, `Thread/interrupted` (clearing), and an
+  `InterruptedException` thrown out of a blocking wait. `observe_test`'s
+  `interrupt-current!` really interrupts, as missionary's does. The only edit
+  is that the test clears the flag in a `finally`: it is thread state, not test
+  state, so left set it survives into the next namespace and kills the first
+  blocking wait there.
 
-## Known defect: the suite can hang, and three tests overrun their budgets
+## Known defects: a parallelism race, and three tests that overrun
 
-**Roughly one run in ten of `ebb.core-test` hangs outright** in the `mailbox`
-test, spinning all four carriers at 75-80% CPU each rather than sitting idle.
-It is a livelock, not a quiet deadlock. Tracked as `ebb-8nq.23`, and not
-explained yet. When the suite does not hang it passes: 225 tests, 265
-assertions.
+`ebb.core-test` is unreliable. On the default 4 carriers, roughly 1 run in 5
+fails and 1 in 7 hangs outright, spinning every carrier. Everything else in the
+suite is stable. Tracked as `ebb-8nq.23`.
 
-The same three tests -- `semaphore`, `rendezvous`, `mailbox` -- also sometimes
-fail with `Task timed out` instead. All three have the same shape: 100 `sp`
-processes hot-looping on a port under an inner `(m/timeout ... 100)`, inside a
-task the harness cancels at 150ms and fails at 200ms.
+### There are two problems, and they pull in opposite directions
 
-### What the measurements say
+Running `ebb.core-test` alone, six runs at each carrier count:
 
-The cost is **cancellation wind-down**, not steady-state throughput. Measured as
-the delay between the inner 100ms timeout firing and the join of the 100
-processes finally settling, three runs each:
+| carriers | clean | `Task timed out` | hang |
+|---|---|---|---|
+| 1 | 0 | **6** | 0 |
+| 2 | 2 | 4 | 0 |
+| 4 (default) | 4 | 1 | 1 |
+| 8 | 0 | 1 | **5** |
+| 16 | 0 | 0 | **6** |
 
-| Shape | Wind-down after the inner timeout |
+That separates them cleanly:
+
+- **The hang is a race that parallelism exposes.** It never happens on one or
+  two carriers and is near-certain on eight or more. So it is a data race in
+  code that runs concurrently — the CAS ports, or the cancellation wind-down —
+  and *not* carrier starvation, which was the previous theory here and predicted
+  the opposite slope.
+- **The timeouts are throughput**, worst when parallelism is scarcest. Three
+  tests (`semaphore`, `rendezvous`, `mailbox`) run 100 `sp` processes
+  hot-looping on a port under an inner `(m/timeout ... 100)`, inside a task the
+  harness cancels at 150ms and fails at 200ms. On one carrier that simply does
+  not fit.
+
+The default of 4 sits at the crossover, which is why it presents as
+"occasionally one or the other".
+
+### Wind-down cost
+
+Measured as the delay between the inner 100ms timeout firing and the join of
+the 100 processes settling, three runs each:
+
+| Shape | Wind-down |
 |---|---|
-| 100 hot processes, plain `sleep 0`, nothing compelled | **30-40 ms** |
+| 100 hot processes, plain `sleep 0`, nothing compelled | 30-40 ms |
 | `holding` a 7-permit semaphore | 13-29 ms |
 | `compel` + mailbox | 57-83 ms |
 | `compel` + rendezvous | **143-193 ms** |
 
-Against a total budget of 200ms of which the inner phase already spends 100, a
-143-193ms wind-down does not fit. `rendezvous` passes when it passes only
-because the harness's own 150ms cancel reaches the outer task while stragglers
-are still unwinding.
+`mailbox` over 25 runs: min 56, p50 73, p90 92, max 101 ms.
 
-Two earlier conclusions here were wrong, and are corrected rather than deleted
-because both misdirected the search:
+### Corrections to earlier conclusions here
 
-- **"Cancelling 100 `sp` processes takes 1 ms."** That measured processes
-  sitting parked. Cancelling 100 processes that are hot-looping takes 30-40 ms
-  with no `compel` involved at all -- so the baseline, not `compel`, is already
-  most of the mailbox overrun.
+Three, kept because each one sent the search the wrong way:
+
+- **"Cancelling 100 `sp` processes takes 1 ms"** measured *parked* processes.
+  Hot-looping ones take 30-40 ms with no `compel` involved.
 - **"The hangs came from concurrent background jobs competing for carriers."**
-  They did not. The hang reproduces on an otherwise idle machine, running
-  `ebb.core-test` alone, one run at a time.
+  They did not — the hang reproduces on an idle machine, one run at a time.
+- **"Scheduling jitter while 225 tests share four carriers."** The carrier
+  table above refutes this: more carriers makes the hang far worse, not better.
 
 Ruled out by measurement: primitive throughput (a rendezvous handoff is 13.5 us,
-a `(? (sleep 0))` park ~27 us), and `Event` identity under jolt's
-value-comparing `compare-and-set!` -- `deftype` equality on jolt is identity, as
-the CAS ports assume.
+a `(? (sleep 0))` park ~27 us); `compare-and-set!` cost (flat at 0.20 us
+regardless of state size — jolt short-circuits on identity); `Event` identity
+under jolt's value-comparing `compare-and-set!` (`deftype` equality on jolt is
+identity, verified); and process leakage between tests (live process count
+returns to zero after a cancelled task).
 
-Not yet explained: why the wind-down costs ~0.7 ms per process when a park costs
-27 us, and why the `mailbox` case tips over into a livelock. A standalone
-reproducer of the `mailbox` test alone did not hang in 25 runs, so the
-surrounding suite is part of the trigger.
-
-Neither test has been given a looser budget. A test that is far inside its
-budget and still trips is reporting something real, and widening it would hide
-the next regression in the same place.
+Neither budget has been widened. A test far inside its budget that still trips
+is reporting something real.
 
 ## Tests not ported, and why
 
 | Namespace | Why |
 |---|---|
-| `pub_test`, `sub_test` | Reactive Streams, out of scope. |
 | `tck.cljc` | Ported as `ebb.tck`, but `check!` is rewritten -- see below. `task-spec`, `flow-spec`, `deftask` and `defflow` are verbatim. |
 | `test_dev.clj` | A kaocha watch entry point. |
 
