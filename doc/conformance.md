@@ -8,6 +8,20 @@ feature.
 Ebb runs **missionary's own test suites** for every ported namespace, edited
 only where this file says so. That is the evidence behind most of these rows.
 
+This file is the prose half of the registry. The other half is
+[`divergences.edn`](divergences.edn), which `ebb.conformance-test` checks on
+every `bin/test` run so the two cannot drift: a divergence whose pinning test is
+renamed fails, an entry whose prose is deleted fails, and prose marking an id the
+registry has never heard of fails. The `<!-- divergence: … -->` comments below
+are those anchors — invisible when rendered, and not something you can reword by
+accident.
+
+What the gate cannot do is notice a divergence nobody wrote down. That needs
+missionary as an oracle, and missionary needs a JVM, which is the one thing ebb
+does without. A developer *can* run one — see `ebb-8nq.38`'s notes for the
+recipe, and several entries here were settled that way rather than by reading
+missionary's sources — but it can never be a condition of the suite.
+
 ## Deliberately absent
 
 Nothing. Every public var of missionary's API is present, including
@@ -15,6 +29,7 @@ Nothing. Every public var of missionary's API is present, including
 
 ## Behavioural differences
 
+<!-- divergence: reactive-streams-is-a-protocol -->
 **Reactive Streams is a protocol here, not a Java interface.** Missionary's
 `publisher` returns an `org.reactivestreams.Publisher`; jolt has no Java
 interfaces to implement, so ebb states the same three roles as protocols in
@@ -24,18 +39,21 @@ names and the same contract. The state machines are ports of `Pub.java` and
 with only the interface names swapped. Bridging to a real Reactive Streams
 implementation means extending these protocols to it.
 
+<!-- divergence: subscribe-publisher-round-trip -->
 **`(subscribe (publisher f))` is not a supported round trip** — in ebb or in
 missionary. `Pub` calls `on-next` synchronously from inside `request`, and
 `Sub` calls `request` from inside `transfer`, so wiring one straight into the
 other re-enters the flow notifier before the pending transfer has returned.
 Each side is correct against a counterparty that does not do this.
 
+<!-- divergence: cancelled-is-a-value -->
 **`Cancelled` is a value, not a class.** Missionary throws
 `missionary.Cancelled`; jolt has no user-defined classes, so ebb throws an
 `ex-info` carrying `{:type ::ebb.impl.util/cancelled}`. Use `m/cancelled?`
 rather than `(instance? Cancelled e)`. This is the only edit most ported tests
 needed.
 
+<!-- divergence: park-at-any-depth -->
 **`?` works at any call depth — ebb is a superset here.** Cloroutine's transform
 is lexical, so in missionary `?` must appear syntactically inside the `sp` body
 and a helper function cannot park. Ebb's `sp` is a fiber with a real stack:
@@ -48,6 +66,7 @@ and a helper function cannot park. Ebb's `sp` is a fiber with a real stack:
 Code written for missionary keeps working; code written for ebb may not port
 back.
 
+<!-- divergence: fork-in-finally-refused -->
 **A fork inside a `try` with `finally` is refused.** Jolt compiles `finally` to a
 `dynamic-wind` after-thunk, so re-entering a continuation re-runs it — measured
 at N+1 runs for N branches, where N is correct. Rather than corrupt cleanup
@@ -57,6 +76,7 @@ lexically inside a `finally`'s `try`. Narrow in practice: `catch` is unaffected,
 park), and in missionary's entire `src` + `test` + `doc` corpus `catch` appears
 12 times against a single user-facing `finally`, which wraps a park, not a fork.
 
+<!-- divergence: continuations-are-executor-affine -->
 **Continuations are executor-affine.** A continuation may only be resumed on the
 `(thread, fiber)` that captured it; anything else throws
 `::ebb.impl.prompt/wrong-fiber` rather than hanging, which is what jolt does
@@ -64,11 +84,13 @@ unguarded. Ebb satisfies this itself — `ap` and `cp` processes marshal every
 entry point to an owner fiber — so it is visible only to code reaching into
 `ebb.impl.prompt` directly.
 
+<!-- divergence: ap-cp-cost-a-hop -->
 **`ap` and `cp` cost a scheduling hop per resumption**, because a callback
 enqueues on the owner rather than resuming inline. `sp` does not.
 
 ## Host differences inherited from jolt
 
+<!-- divergence: deftype-field-shadowing -->
 - **A local may not share a name with a mutable `deftype` field.** In some
   shapes such a local reads the FIELD rather than the binding, so a snapshot
   taken before a `set!` comes back holding the value that `set!` wrote. The
@@ -96,7 +118,9 @@ enqueues on the owner rather than resuming inline. `sp` does not.
   Ebb's convention is to prefix such locals `v-`. Worth reporting upstream; see
   `ebb-8nq.24`.
 
+<!-- divergence: strings-are-codepoint-indexed -->
 - **Strings are codepoint-indexed.** `(count "😀")` is 1.
+<!-- divergence: cas-compares-by-value -->
 - **`compare-and-set!` on an atom compares by value**, where JVM Clojure uses
   reference identity. Harmless for ebb's CAS ports — their states are sets and
   maps of `Event` deftypes, which have identity equality, and no `Event` is
@@ -192,6 +216,7 @@ function with no arguments rather than taking the first element, as
 `clojure.core` would; ebb matches, and the test is what will say ebb has to
 change if missionary does.
 
+<!-- divergence: watch-derefs-on-transfer -->
 **Open upstream, and ebb fixes it.** `#89` — `m/watch` takes the new state from
 the watch callback's fourth argument, and references do not order their watches,
 so two concurrent `swap!`s can reach the process in the wrong order and the later
@@ -243,6 +268,7 @@ which is why the trace originally recorded against this looked truncated.
 | `tck.cljc` | Ported as `ebb.tck`, but `check!` is rewritten -- see below. `task-spec`, `flow-spec`, `deftask` and `defflow` are verbatim. |
 | `test_dev.clj` | A kaocha watch entry point. |
 
+<!-- divergence: tck-timeout-is-lowest-priority -->
 ### The tck driver had to change, and why that is a real difference
 
 Missionary's `check!` splits events two ways: raised on the driving thread means
@@ -275,6 +301,7 @@ Two things that rule turns out to require, both learned by getting them wrong:
   millisecond against a 10ms budget -- the failure looked like ebb being slow and
   was not.
 
+<!-- divergence: lolcat-waits-for-declared-events -->
 ### lolcat had to change too, for the same reason
 
 `lolcat.core/call` runs a function and then requires every event that function

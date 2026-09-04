@@ -29,7 +29,7 @@ missionary's API is ported — the three process primitives (`sp`, `ap`, `cp`),
 the propagator and reactor, every port and flow operator, `via`/`blk`/`cpu`,
 and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
 edited only where [doc/conformance.md](doc/conformance.md) says so. The whole
-suite is **275 tests, 1071 assertions**; 196 of those tests are missionary's,
+suite is **280 tests, 1182 assertions**; 196 of those tests are missionary's,
 and the rest are ebb's own — ADR-001's concurrency cases, a stress harness for
 the flow operators, and the repros from missionary's issue tracker.
 
