@@ -108,6 +108,71 @@
           (settle (m/reduce conj [] (m/ap (m/? (m/sleep 10 (m/?> (m/seed [:x :y])))))) 1000))
         "and so must a whole ap-over-sleep pipeline"))
 
+(defn- switch-trace
+  "Feed :a then :b into an observe, through `build`, and answer the trace the
+  consumer saw. Each call gets its OWN log and iterator cell: a cancelled ap
+  can still raise a notification after the fact, and sharing them let one case
+  land in the next one's window."
+  [build]
+  (let [emit  (promise)
+        input (m/observe (fn [!] (deliver emit !) (fn [])))
+        log   (atom [])
+        itr   (atom nil)
+        ps    ((build input log)
+               (fn [] (swap! log conj
+                        (if-some [it @itr]
+                          (try [:val (deref it)] (catch Throwable e [:err (ex-message e)]))
+                          [:early])))
+               (fn [] (swap! log conj :done)))]
+    (reset! itr ps)
+    (let [i! (deref emit 1000 nil)]
+      (i! :a) (Thread/sleep 60)
+      (i! :b) (Thread/sleep 400)
+      (let [trace @log] (ps) (Thread/sleep 50) trace))))
+
+(t/deftest switch-interrupts-a-branch-that-has-forked
+  ;; ebb-8nq.34, and not one of missionary's issues -- missionary gets this
+  ;; right and ebb did not. `?<` promises that each new value interrupts the
+  ;; branch in flight. Ebb interrupted only a task the branch was parked on
+  ;; DIRECTLY: `ebb.impl.ambiguous` kept one cancel fn on the switch's own
+  ;; Choice, so as soon as the branch forked -- any `?>`, any `amb` of two or
+  ;; more forms -- the switch had no handle on it and the replaced branch ran
+  ;; on beside its replacement. Ambiguous.java walks the whole subtree.
+  ;;
+  ;; Both expectations were taken from missionary itself -- b.47, java impls
+  ;; compiled out of the checkout and the same program run against it -- rather
+  ;; than reasoned about, because #86 showed how easily reasoning about `?<`
+  ;; goes wrong.
+  (t/testing "the park is directly under the switch -- debounce's shape"
+    (t/is (= [[:cut :a] [:val :b]]
+             (switch-trace
+               (fn [input log]
+                 (m/ap (let [v (m/?< input)]
+                         (try (m/? (m/sleep 150 v))
+                              (catch Throwable e
+                                (when (m/cancelled? e) (swap! log conj [:cut v]))
+                                (m/amb))))))))))
+  (t/testing "the branch forked first, so the park belongs to a descendant"
+    (let [trace (switch-trace
+                  (fn [input log]
+                    (m/ap (let [v (m/?< input)]
+                            (m/amb (try (m/? (m/sleep 150 v))
+                                        (catch Throwable e
+                                          (when (m/cancelled? e) (swap! log conj [:cut v]))
+                                          (m/amb)))
+                                   [:tail v])))))]
+      ;; the whole of :a's branch goes: its sleep AND the amb's own seed. Before
+      ;; the fix this read [[:val [:tail :a]] [:val :a] ...] -- :a was never cut
+      ;; and ran to completion alongside :b.
+      (t/is (= [:cut :a] (first trace)) "the replaced branch is interrupted")
+      (t/is (not (some #{[:val :a]} trace)) "and never produces")
+      ;; What follows diverges from missionary, and not because of `?<`:
+      ;; cancelling the amb's own seed makes it fail, and an uncaught error in
+      ;; a branch must fail the WHOLE ap. Missionary nils its notifier, kills
+      ;; the process and drops the queue; ebb delivers the error and carries on
+      ;; with the branches still in flight. ebb-8nq.38.
+      (t/is (some #{[:err "Seed cancelled."]} trace)))))
+
 (t/deftest ap-switch-over-amb-recur-terminates-86
   ;; #86: OPEN upstream. The repro, verbatim:
   ;;

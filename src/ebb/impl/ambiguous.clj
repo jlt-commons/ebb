@@ -24,7 +24,7 @@
             [ebb.impl.util :refer [nop cancelled]]
             [ebb.impl.server :as server]))
 
-(declare pump! settle! cancel transfer step! handle! call! cast! switch? register! deregister! current)
+(declare pump! settle! cancel transfer step! handle! call! cast! cut! switch? register! deregister! current)
 
 ;; Two counters, each with one job:
 ;;
@@ -65,8 +65,10 @@
                  ;; only bump `avail`; the caller pumps once the choice is armed.
                  ^:unsynchronized-mutable armed
                  ^:unsynchronized-mutable reaped
-                 ;; switch (par < 0) only: how to interrupt the branch currently
-                 ;; in flight, so the next value can replace it
+                 ;; how to interrupt the branch this Choice currently has in
+                 ;; flight: the cancel fn of the task it is parked on, or nil
+                 ;; while it is running or between parks. Every Choice carries
+                 ;; one, not only switches -- see `cut!`.
                  ^:unsynchronized-mutable interrupt])
 
 ;; --------------------------------------------------------------- branch steps
@@ -103,13 +105,18 @@
                       (cast! ps (fn []
                                   (when-not @fired
                                     (vreset! fired true)
+                                    ;; the park is over, so its canceller is no
+                                    ;; longer this branch's interrupt
+                                    (when owner (set! (.-interrupt ^Choice owner) nil))
                                     (handle! ps owner
                                              (step! ps #(p/resume (.-prompt ps) k answer)))
                                     (pump! ps))))
                       nil)]
           (let [c (a (fn [x] (done! [::ok x])) (fn [e] (done! [::err e])))]
-            (when (and owner (neg? (.-par ^Choice owner)))
-              (set! (.-interrupt ^Choice owner) c))
+            ;; EVERY choice records this, not just a switch. A switch has to
+            ;; reach the task at the bottom of the branch it is replacing, and
+            ;; once that branch has forked the park belongs to a descendant.
+            (when owner (set! (.-interrupt ^Choice owner) c))
             (watch-park! ps c)))
 
         ::fork
@@ -130,19 +137,67 @@
                 ((.-iterator ch)))
               nil))))))
 
+(defn- interrupt!
+  "Cancel the task this choice's branch is parked on, if any. Idempotent: the
+  canceller is taken before it is invoked."
+  [^Choice ch]
+  (when-some [c (.-interrupt ch)]
+    (set! (.-interrupt ch) nil)
+    (c))
+  nil)
+
+(defn- under?
+  "Is c a descendant of ch? Choices carry the Choice whose branch forked them,
+  so the branch a switch has in flight is exactly the choices whose parent
+  chain reaches it."
+  [^Choice c ^Choice ch]
+  (loop [^Choice p (.-parent c)]
+    (cond (nil? p)                false
+          (identical? p ch)       true
+          :else                   (recur (.-parent p)))))
+
+(defn- cut!
+  "Interrupt the whole branch a switch has in flight -- ebb-8nq.34.
+
+  Cancelling one task is not enough, and that is what this used to do. A branch
+  that has FORKED is no longer parked on anything itself: it became a Choice,
+  and the task at the bottom belongs to a descendant. `?<` promises that a new
+  value interrupts the branch in flight, so the reach has to be the whole
+  subtree -- every choice the branch created, its flow, and the task at the
+  leaf. Ambiguous.java says the same thing with its `walk`/`cancel` mutual
+  recursion over the branch ring; ebb keeps choices in one vector with a
+  `parent` link, so the subtree is a filter rather than a walk.
+
+  DEEPEST FIRST. Cancelling a flow can make it notify or terminate
+  synchronously, which re-enters the pump on this same fiber, and a parent that
+  is already dead must not be handed work by a child that is still dying.
+
+  Nothing here stops the branch's CONTINUATION -- nothing can. The cancelled
+  task fails with Cancelled, that surfaces at the `?` which parked, and the
+  body decides. That is the contract debounce relies on:
+    (ap (let [x (?< flow)] (try (? (sleep d x)) (catch Cancelled _ (amb)))))"
+  [^Process ps ^Choice ch]
+  (let [chs (.-choices ps)
+        ;; snapshot: cancelling a child can append to `choices`
+        n   (count chs)]
+    ;; a loop, not a `doseq` over `reverse` -- realizing a lazy seq takes a
+    ;; counted lock and the cancels below can park (ADR-001 rule 5)
+    (loop [i (dec n)]
+      (when-not (neg? i)
+        (let [^Choice c (nth chs i)]
+          (when (and (.-live c) (under? c ch))
+            (set! (.-live c) false)
+            (when-some [it (.-iterator c)] (it))
+            (interrupt! c)))
+        (recur (dec i)))))
+  (interrupt! ch)
+  nil)
+
 (defn- run-choice!
   "Consume one available upstream value and start a branch from it."
   [^Process ps ^Choice ch]
   (set! (.-avail ch) (dec (.-avail ch)))
-  ;; `?<` interrupts the branch it is replacing. It cannot stop a running
-  ;; continuation -- nothing can -- so it cancels whatever task that branch is
-  ;; parked on, which surfaces as Cancelled at its `?`. That is exactly what
-  ;; missionary's debounce relies on:
-  ;;   (ap (let [x (?< flow)] (try (? (sleep d x)) (catch Cancelled _ (amb)))))
-  (when (switch? ch)
-    (when-some [c (.-interrupt ch)]
-      (set! (.-interrupt ch) nil)
-      (c)))
+  (when (switch? ch) (cut! ps ch))
   (set! (.-flight ch) (inc (.-flight ch)))
   (set! (.-branches ps) (inc (.-branches ps)))
   (let [x (try [::ok @(.-iterator ch)] (catch Throwable e [::err e]))]

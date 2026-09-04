@@ -24,22 +24,22 @@ jolt's Chez Scheme runtime, on fibers.
 ;=> [1 1 2 2 3 3]
 ```
 
-**Status: feature-complete, with four open defects.** Every public var of
+**Status: feature-complete, with five open defects.** Every public var of
 missionary's API is ported — the three process primitives (`sp`, `ap`, `cp`),
 the propagator and reactor, every port and flow operator, `via`/`blk`/`cpu`,
 and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
 edited only where [doc/conformance.md](doc/conformance.md) says so. The whole
-suite is **266 tests, 1046 assertions**; 196 of those tests are missionary's,
+suite is **267 tests, 1050 assertions**; 196 of those tests are missionary's,
 and the rest are ebb's own — ADR-001's concurrency cases, a stress harness for
 the flow operators, and the repros from missionary's issue tracker.
 
 The suite is **39 runs in 40 clean, with no hangs**, and the one failure is a
-timing budget rather than a stall. Getting there fixed eleven concurrency defects,
+timing budget rather than a stall. Getting there fixed twelve concurrency defects,
 most of them found by measurement or by enumerating interleavings rather than
 by reading code — the story is in
 [model/](model/README.md) and
 [doc/conformance.md](doc/conformance.md#known-defects), which also lists the
-four that remain open.
+five that remain open.
 
 ## Install
 
