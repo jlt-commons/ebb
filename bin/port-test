@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Port a missionary test namespace to ebb.
+
+Mechanical only: renames the namespace, repoints missionary.core at ebb.core,
+drops the `missionary.Cancelled` import (ebb signals cancellation with an
+ex-info, so there is no class to import) and rewrites the predicate that used
+it. Anything else that needs changing is a real porting decision and should be
+made by hand, in the file, with a comment saying why.
+"""
+import re, sys, pathlib
+
+SRC = pathlib.Path("/home/yogthos/src/missionary/test/missionary")
+DST = pathlib.Path("test/ebb")
+
+def port(name):
+    src = SRC / f"{name}_test.cljc"
+    if not src.exists():
+        src = SRC / f"{name}_test.clj"
+    s = src.read_text()
+
+    # drop the Cancelled import and re-close the ns form it was closing
+    s, n = re.subn(r"\n\s*\(:import [\[(]missionary Cancelled[\])]\)\)", ")", s)
+    if not n:
+        s = re.sub(r"\n\s*\(:import [\[(]missionary Cancelled[\])]\)", "", s)
+
+    s = s.replace("missionary.core", "ebb.core")
+    s = re.sub(r"\bmissionary\.([a-z0-9_-]+)-test\b", r"ebb.\1-test", s)
+    s = s.replace("(partial instance? Cancelled)", "m/cancelled?")
+    s = s.replace("(partial instance? missionary.Cancelled)", "m/cancelled?")
+
+    if "Cancelled" in s:
+        print(f"  !! {name}: 'Cancelled' still present, needs a hand edit", file=sys.stderr)
+
+    hdr = (f";; Ported from missionary test/missionary/{src.name} (EPL 2.0).\n"
+           f";; Mechanical port: missionary.core -> ebb.core, and the\n"
+           f";; missionary.Cancelled import/predicate -> ebb's m/cancelled?.\n")
+    (DST / f"{name}_test.clj").write_text(hdr + s)
+    print(f"  ported {name}")
+
+for name in sys.argv[1:]:
+    port(name)

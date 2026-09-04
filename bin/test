@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Run the ebb test suite. Pass namespace names to run only those.
+cd "$(dirname "$0")/.." && exec jolt -A:test -m ebb.runner "$@"

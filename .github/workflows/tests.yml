@@ -1,0 +1,34 @@
+name: tests
+
+# Ebb's gate is missionary's own test suite running on jolt. There is nothing to
+# build: a jolt project has no compile step, so the whole job is "install jolt,
+# run the tests".
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A clean suite finishes in well under a minute. About one run in ten hangs
+    # instead, spinning every carrier (ebb-8nq.23), so expect intermittent red
+    # until that is closed. A low ceiling turns the hang into a fast failure
+    # rather than a job sitting on a runner until GitHub's 6-hour default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # The prebuilt jolt binary is self-contained -- runtime, compiler and
+      # stdlib in one executable -- so there is no Chez, JVM or C toolchain to
+      # install. It lands in ~/.local/bin, which is not on PATH by default.
+      - name: Install jolt
+        run: |
+          curl --fail --retry 5 --retry-delay 5 --retry-all-errors -sL \
+            https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        run: jolt --version
+
+      - name: Tests
+        run: bin/test

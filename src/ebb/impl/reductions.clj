@@ -1,0 +1,49 @@
+;; Derived from missionary/impl/Reductions.cljs (missionary, EPL 2.0).
+;; See Reductions.java for the synchronisation strategy (ADR-001 rule 1).
+(ns ^:no-doc ebb.impl.reductions)
+
+(declare transfer)
+(deftype Process [^:unsynchronized-mutable reducer ^:unsynchronized-mutable notifier terminator ^:unsynchronized-mutable result ^:unsynchronized-mutable input ^:unsynchronized-mutable busy ^:unsynchronized-mutable done]
+  clojure.lang.IFn
+  (invoke [_] (input))
+  clojure.lang.IDeref
+  (deref [p] (transfer p)))
+
+(defn ready [^Process p]
+  (loop [cb nil]
+    (if (set! (.-busy p) (not (.-busy p)))
+      (if (.-done p)
+        (.-terminator p)
+        (if (nil? (.-reducer p))
+          (do (try @(.-input p) (catch Throwable _ nil))
+              (recur cb)) (.-notifier p))) cb)))
+
+(defn transfer [^Process ps]
+  (try
+    (let [f (.-reducer ps)
+          r (.-result ps)
+          r (if (identical? r ps)
+              (f) (f r @(.-input ps)))]
+      (set! (.-result ps)
+        (if (reduced? r)
+          (do ((.-input ps))
+              (set! (.-reducer ps) nil)
+              @r) r)))
+    (catch Throwable e
+      ((.-input ps))
+      (set! (.-notifier ps) nil)
+      (set! (.-reducer ps) nil)
+      (set! (.-result ps) e)))
+  (when-some [cb (ready ps)] (cb))
+  (if (nil? (.-notifier ps))
+    (throw (.-result ps))
+    (.-result ps)))
+
+(defn run [rf f n t]
+  (let [ps (->Process rf n t nil nil true false)]
+    (set! (.-result ps) ps)
+    (set! (.-input ps)
+      (f #(when-some [cb (ready ps)] (cb))
+        #(do (set! (.-done ps) true)
+             (when-some [cb (ready ps)]
+               (cb))))) (n) ps))

@@ -4,3 +4,6 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# jolt's per-project dependency cache
+.jolt/cpcache/

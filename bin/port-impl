@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Port a missionary .cljs impl to ebb.
+
+Mechanical translation only. Deftype field mutability, the sync strategy from
+the .java counterpart, and anything host-specific are left for a hand pass --
+this just removes the ClojureScript.
+"""
+import re, sys, pathlib
+
+SRC = pathlib.Path("/home/yogthos/src/missionary/src/missionary/impl")
+
+def port(camel, target):
+    s = (SRC / f"{camel}.cljs").read_text()
+    ns = "ebb.impl." + target.replace("_", "-")
+    s = re.sub(r"\(ns (\^:no-doc )?missionary\.impl\.\w+", lambda m: f"(ns ^:no-doc {ns}", s)
+    s = s.replace("missionary.impl.PairingHeap", "ebb.impl.pairing-heap")
+    s = s.replace("(:import missionary.Cancelled)", "(:require [ebb.impl.util :refer [cancelled]])")
+    s = re.sub(r"\(Cancelled\. ", "(cancelled ", s)
+    s = s.replace("catch :default", "catch Throwable")
+    s = re.sub(r"\(catch Throwable (\w+)\)", r"(catch Throwable \1 nil)", s)
+    s = re.sub(r"^  IFn$", "  clojure.lang.IFn", s, flags=re.M)
+    s = re.sub(r"^  IDeref$", "  clojure.lang.IDeref", s, flags=re.M)
+    s = s.replace("IFn\n", "clojure.lang.IFn\n").replace("IDeref\n", "clojure.lang.IDeref\n")
+    s = re.sub(r"\(reify IDeref", "(reify clojure.lang.IDeref", s)
+    s = re.sub(r"\(reify IFn", "(reify clojure.lang.IFn", s)
+    s = s.replace("clojure.lang.clojure.lang.", "clojure.lang.")
+    s = re.sub(r"\(-invoke \[", "(invoke [", s)
+    s = re.sub(r"\(-deref \[", "(deref [", s)
+    s = s.replace("(iter ", "(.iterator ")
+    s = s.replace("(js-obj)", "(Object.)")
+    s = re.sub(r'\(js/Error\. ("(?:[^"\\]|\\.)*")\)', r'(ex-info \1 {})', s)
+    s = s.replace("(->MapEntry ", "(clojure.lang.MapEntry. ")
+    s = s.replace("(make-array ", "(object-array ")
+    s = s.replace("(js-mod ", "(mod ")
+    s = re.sub(r"\(== ", "(= ", s)
+    s = re.sub(r"\^number ", "", s)
+    s = re.sub(r"\^boolean ", "", s)
+    s = re.sub(r"\(defn \^boolean ", "(defn ", s)
+    hdr = (f";; Derived from missionary/impl/{camel}.cljs (missionary, EPL 2.0).\n"
+           f";; See {camel}.java for the synchronisation strategy (ADR-001 rule 1).\n")
+    out = pathlib.Path(f"src/ebb/impl/{target}.clj")
+    out.write_text(hdr + s)
+    print(f"  ported {camel} -> {out}")
+
+for a in sys.argv[1:]:
+    camel, target = a.split(":")
+    port(camel, target)

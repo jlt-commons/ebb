@@ -1,0 +1,17 @@
+ebb
+Copyright (c) 2025 ebb contributors
+
+This product includes software derived from Missionary
+(https://github.com/leonoel/missionary), Copyright (c) 2018-2024 Leon Talbot
+and contributors, licensed under the Eclipse Public License 2.0.
+
+The test DSL under test/lolcat/ is derived from lolcat
+(https://github.com/leonoel/lolcat), same author and license.
+
+ebb is a port of missionary to jolt (https://github.com/jolt-lang/jolt). It is
+pure Clojure: the JVM and ClojureScript host layers, the cloroutine dependency,
+and the reactive-streams integration are not carried over. Files derived from
+missionary carry a header naming the missionary source they came from.
+
+ebb is distributed under the Eclipse Public License 2.0, the same license as
+both missionary and jolt. See LICENSE.
