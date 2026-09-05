@@ -146,18 +146,17 @@ enqueues on the owner rather than resuming inline. `sp` does not.
 
 ## Known defects
 
-The suite's only flakes are two tests against 10ms budgets, each failing on a
-single ~10.3ms outlier about once in 400 runs:
+The suite is **20 runs in 20 clean**. The two tests that used to flake sit
+against 10ms budgets, and both now have headroom — `ebb-8nq.40` cut the cost of
+starting an `ap` by about a third, which is most of what they were spending:
 
 | | p50 | p90 | p99 | max | over 10ms |
 |---|---|---|---|---|---|
-| `reactor-delayed` | 5.05ms | 5.46ms | 6.54ms | 10.32ms | 1/400 |
-| `ambiguous-eval-order` | 2.26ms | 2.53ms | 5.10ms | 10.33ms | 1/400 |
+| `reactor-delayed` | 4.72ms | 5.17ms | 8.10ms | 9.65ms | 0/400 |
+| `ambiguous-eval-order` | 1.98ms | 2.22ms | 4.58ms | 9.90ms | 0/400 |
 
-Neither has ever produced a wrong value; both are ebb being slow, and the shape
-(a lone outlier against a tight p99) is a GC pause rather than systematic
-slowness. No budget has been widened — `ebb-8nq.40` carries making an `ap` value
-cost less than the ~600µs it currently does. What remains, and what was fixed,
+Neither has ever produced a wrong value; both were ebb being slow. No budget has
+been widened. What remains, and what was fixed,
 is worth stating precisely because most of it was found by measurement rather
 than by reading.
 
@@ -186,7 +185,9 @@ than by reading.
 
 ### Open
 
-- **`?<` does not interrupt a branch that has forked** (`ebb-8nq.34`). `?<` in an `ap` promises that each new value interrupts the branch in flight, and ebb delivers that only when the branch is parked on a task *directly*: `ebb.impl.ambiguous` keeps one cancel fn on the switch's own `Choice`, so as soon as the branch forks — any `?>`, any `amb` of two or more forms — the switch has no handle on it and the old branch runs on beside the new one. `Ambiguous.java` walks the replaced branch's whole subtree instead. Debounce, the canonical `?<` shape, is correct today.
+Nothing is currently known to be wrong. What is left is a constraint rather
+than a defect:
+
 - **Inside a reactor, `ap`/`cp` callbacks are still synchronous.** `server/cast!` degrades to `call!` when the caller has ambient context in scope, because a carried local stands in for a `ThreadLocal` and the callee's writes have to be visible to the caller on return — a cast has no reply to bring them back in. ADR-001 rule 6.
 
 No test budget has been widened. A test far inside its budget that still trips
