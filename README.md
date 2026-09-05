@@ -1,14 +1,15 @@
-# ebb
 
-A port of [missionary](https://github.com/leonoel/missionary) to
-[jolt](https://github.com/jolt-lang/jolt). Pure Clojure, no JVM, no
-ClojureScript, no `cloroutine`.
+## Ebb
+
+Ebb suggests a natural, rhythmic flow, much like data moving through a reactive
+system. It is a port of [missionary](https://github.com/leonoel/missionary) to
+[Jolt](https://github.com/jolt-lang/jolt) written in pure Clojure.
 
 Missionary is a functional effect system for Clojure. It gives you composable
 **tasks**, which produce one value eventually, and **flows**, which produce many
 values with backpressure. Both come with real cancellation and glitch-free
-dataflow propagation. Ebb is that system running on jolt's Chez Scheme runtime,
-on fibers.
+dataflow propagation. Ebb is that system running on Jolt's Chez Scheme runtime
+using fibers.
 
 ```clojure
 (require '[ebb.core :as m])
@@ -25,7 +26,7 @@ on fibers.
 ;=> [1 1 2 2 3 3]
 ```
 
-Every public var of missionary's API is ported. That covers the three process
+Every public var of missionary's API is supported. That covers the three process
 primitives `sp`, `ap` and `cp`, the propagator and reactor, every port and flow
 operator, `via`/`blk`/`cpu`, and `publisher`/`subscribe`.
 
@@ -35,14 +36,10 @@ Ebb runs missionary's own test namespaces, edited only where
 
 ## Install
 
-Ebb needs [jolt](https://github.com/jolt-lang/jolt) v0.8.1 or newer and nothing
-else. No Chez, no JVM, no C toolchain.
+Ebb needs Jolt v0.8.1 or newer.
 
-```bash
-curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
-```
 
-Then depend on ebb as a git library, pinning a commit:
+Depend on ebb as a git library by pinning a commit:
 
 ```clojure
 {:deps {jlt-commons/ebb {:git/url "https://github.com/jlt-commons/ebb"
@@ -53,8 +50,9 @@ There's no release on Clojars yet.
 
 ## What differs from missionary
 
-Three differences you'll actually notice. The exhaustive list lives in
-[doc/conformance.md](doc/conformance.md), and anything missing from it is a bug.
+The exhaustive list lives in
+[doc/conformance.md](doc/conformance.md), and three user visible
+differences are as follows.
 
 **`?` parks at any call depth.** Cloroutine's transform is lexical, so
 missionary needs `?` to appear syntactically inside the `sp` body and a helper
@@ -66,16 +64,16 @@ matter.
 (m/? (m/sp (inc (helper 10 5))))            ;=> 6
 ```
 
-Missionary code keeps working here. Ebb code may not port back.
+Missionary code keeps working here, but Ebb code may not port back.
 
 **`Cancelled` is a value rather than a class.** Jolt has no user-defined
 classes, so ebb throws an `ex-info`. Test it with `m/cancelled?` instead of
-`instance?`. This is the only edit most ported tests needed.
+`instance?`.
 
 **Reactive Streams is a protocol rather than a Java interface.** `publisher`
 returns something implementing `ebb.rs/Publisher`, not
 `org.reactivestreams.Publisher`. Same three roles and same contract, stated in
-Clojure because jolt has no Java interfaces. Missionary's own `pub_test` and
+Clojure because Jolt has no Java interfaces. Missionary's own `pub_test` and
 `sub_test` run against it with the interface names swapped.
 
 ## Tests
@@ -84,10 +82,6 @@ Clojure because jolt has no Java interfaces. Missionary's own `pub_test` and
 bin/test                    # the whole suite
 bin/test ebb.rdv-test       # one namespace
 ```
-
-Test namespaces are found by scanning `test/ebb/*_test.clj`, so adding a file is
-enough. `bin/port-test` and `bin/port-impl` mechanically translate more of
-missionary's sources and warn on the constructs that need a human.
 
 ## Documentation
 
@@ -104,11 +98,6 @@ missionary's sources and warn on the constructs that need a human.
   the conventions a change is expected to follow.
 - [model/README.md](model/README.md) holds core.logic models that enumerate
   every interleaving of the concurrency design.
-
-## Why "ebb"
-
-It suggests a natural, rhythmic flow, much like data moving through a reactive
-system. One punchy syllable, memorable, and not taken by an existing library.
 
 ## License
 
