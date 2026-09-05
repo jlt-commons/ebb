@@ -51,6 +51,11 @@
   :summary  "(subscribe (publisher f)) is not supported, in ebb or in missionary. Pub calls on-next synchronously from inside request and Sub calls request from inside transfer, so wiring one into the other re-enters the notifier before the pending transfer returned."
   :unpinned "Shared with missionary and not an ebb divergence at all. Listed because a reader comparing the two will wonder."}
 
+ {:id       :post-drives-the-consumer-on-its-own-fiber
+  :kind     :behaviour
+  :summary  "missionary runs a parked party's continuation inline on the delivering thread, so a locking block around a post is re-entered by that same thread. Ebb hands over and parks the poster until the process is quiescent, on another fiber, so delivering from inside a lock the consumer needs deadlocks both sides. Applies to mbx, dfv, rdv, sem and task invocation alike."
+  :pinned-by ebb.concurrency-test/delivery-does-not-run-the-consumer-inline}
+
  {:id       :ap-cp-cost-a-hop
   :kind     :behaviour
   :summary  "ap and cp pay a scheduling hop per resumption. A callback cannot resume the process inline, so it enqueues and the owner fiber picks it up. See ADR-001 rule 2."
