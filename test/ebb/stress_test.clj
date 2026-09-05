@@ -298,3 +298,50 @@
        (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
       (in-parallel 2 (fn [i] (dotimes [_ target] (swap! (if (zero? i) a b) inc))))
       (is (= [:ok [target target]] (deref out timeout-ms [:err ::timeout]))))))
+
+(deftest sample-never-derefs-one-input-twice-at-once
+  ;; ebb-8nq.33. Sample.java holds the process monitor across BOTH derefs of a
+  ;; slot -- `dirty`'s eager discard and `transfer`'s resample -- and ebb cannot
+  ;; hold anything across a deref, since for an ap input it parks (rule 5).
+  ;;
+  ;; The old code let both run at once: `mark!` answered "already dirty, go
+  ;; drain" without clearing the flag, so `resample!` took the still-dirty slot
+  ;; and deref'd alongside it. Every flow impl in ebb and in missionary assumes
+  ;; its transfer is never concurrent with itself -- that assumption is what all
+  ;; those busy toggles are FOR -- so this is the shape that corrupts them.
+  ;;
+  ;; Asserted directly rather than through its consequences: the input counts
+  ;; how many derefs are inside it at once. A consequence-based test would be
+  ;; hunting a rare corruption; this one saw 2630 overlaps in 20 runs.
+  (let [overlaps (atom 0)
+        depth    (atom 0)
+        input    (fn [n t]
+                   (let [live (atom true) v (atom 0)]
+                     (n)
+                     ;; a bounded rate, not a spin: hammering the notifier
+                     ;; starves the carrier pool and the rest of the suite
+                     ;; times out around it
+                     (doto (Thread. (fn [] (loop []
+                                             (when @live
+                                               (Thread/sleep 0 100000)
+                                               (swap! v inc) (n) (recur)))))
+                       (.setDaemon true) (.start))
+                     (reify
+                       ;; a cancelled flow must terminate, or sample's `alive`
+                       ;; never reaches zero and nothing downstream completes
+                       clojure.lang.IFn
+                       (invoke [_] (when (compare-and-set! live true false) (t)) nil)
+                       clojure.lang.IDeref
+                       (deref [_]
+                         (when (> (swap! depth inc) 1) (swap! overlaps inc))
+                         ;; widen the window: an overlap that exists must be
+                         ;; seen, not merely be possible
+                         (Thread/sleep 0 500000)
+                         (swap! depth dec)
+                         @v))))]
+    (dotimes [_ 4]
+      (let [out (promise)]
+        ((m/reduce conj [] (m/sample vector input (offloaded (range 12))))
+         (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
+        (is (= :ok (first (deref out timeout-ms [:err ::timeout]))))))
+    (is (zero? @overlaps) "a sampled input is never deref'd by two parties at once")))
