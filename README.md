@@ -33,9 +33,10 @@ suite is **281 tests, 1187 assertions**; 196 of those tests are missionary's,
 and the rest are ebb's own — ADR-001's concurrency cases, a stress harness for
 the flow operators, and the repros from missionary's issue tracker.
 
-The suite is **20 runs in 20 clean, with no hangs**. Getting there fixed nineteen concurrency defects,
-most of them found by measurement or by enumerating interleavings rather than
-by reading code — the story is in
+The suite is **20 runs in 20 clean, with no hangs**. Getting there fixed
+sixteen concurrency defects and two scheduling costs, most of them found by
+measurement, by enumerating interleavings, or by running the same program
+against missionary itself rather than by reading code — the story is in
 [model/](model/README.md) and
 [doc/conformance.md](doc/conformance.md#known-defects).
 
@@ -103,8 +104,11 @@ of missionary's sources, warning on the constructs that need a human.
 - [doc/conformance.md](doc/conformance.md) — every observable difference from
   missionary. Exhaustive by intent, following jolt's own
   `known-divergences.edn` pattern.
+- [doc/divergences.edn](doc/divergences.edn) — the same registry, machine
+  readable. `ebb.conformance-test` checks the two against each other on every
+  `bin/test`, so neither can rot away from the other.
 - [doc/adr/001-fiber-affinity.md](doc/adr/001-fiber-affinity.md) — the design,
-  and why it is shaped this way. Five rules, each one earned by a bug.
+  and why it is shaped this way. Six rules, each one earned by a bug.
 - [doc/evaluation.md](doc/evaluation.md) — the feasibility study the port was
   built on, with its wrong turns corrected inline.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, test and port; the

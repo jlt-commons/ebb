@@ -351,4 +351,4 @@ comparing the two sources is not surprised.
   has no stable identity to remove on a CAS retry.
 - **Combinators loop rather than map.** Realizing a lazy seq takes a counted
   lock, and jolt forbids parking under one, so `(dorun (map-indexed ...))` over
-  child tasks deadlocks. See ADR-001 rule 4.
+  child tasks deadlocks. See ADR-001 rule 5.

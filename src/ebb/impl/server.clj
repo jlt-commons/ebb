@@ -52,6 +52,24 @@
 ;; ThreadLocal -- needs the callee's writes back, and a cast has nothing to
 ;; bring them back in. See `cast!`.
 ;;
+;; ---------------------------------------------------------------------------
+;; start!, and why starting is not just spawn-then-call
+;;
+;; A process's owner fiber has to run its start-up -- register the prompt, run
+;; the body to its first suspension, pump once -- and the obvious way to arrange
+;; that is `spawn` followed by `call!`. That is two handshakes, and the second
+;; is the expensive kind: the fiber has only just been created and is parked on
+;; its channel, so waking it costs a COLD scheduling round trip. Measured on
+;; `(m/reduce conj [] (m/ap (m/?> (m/seed [1]))))`, 41us for the spawn and 47us
+;; for the call!, out of 336us end to end.
+;;
+;; `start!` does both in one: it spawns the fiber and hands it the start-up as
+;; its first act, delivering `ready` only once that has run. 333us -> 218us on
+;; the minimum of 45 measurements (ebb-8nq.40). Cold is also the number to
+;; reason with elsewhere: a hot owner answers a call! in ~27us and a cold one in
+;; 45-55us, and pricing hops at the hot figure is what led ebb-8nq.36 to
+;; conclude marshalling was negligible when it is about half.
+;;
 ;; The mailbox below is UNBOUNDED. That was a bug fix before it was a
 ;; prerequisite for cast!: offer! on a full channel returns false exactly as it
 ;; does on a closed one, and the old code read both as "retired" and ran the

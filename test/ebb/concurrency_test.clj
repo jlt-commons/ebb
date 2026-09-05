@@ -62,7 +62,7 @@
                                     (m/sp (m/? v)) (m/sp (m/? v))
                                     (m/sp (m/? v)))))))))))
 
-;; --- ADR-001 rule 3: no task invocation inside a locked region --------------
+;; --- ADR-001 rule 5: no task invocation inside a locked region --------------
 
 (deftest no-park-under-a-lazy-seq-lock
   (testing "a combinator must not spawn its children inside a lazy seq"
