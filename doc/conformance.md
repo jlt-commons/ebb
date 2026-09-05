@@ -78,6 +78,42 @@ unguarded. Ebb satisfies this itself, since `ap` and `cp` processes marshal
 every entry point to an owner fiber, so it's visible only to code reaching into
 `ebb.impl.prompt` directly.
 
+<!-- divergence: post-drives-the-consumer-on-its-own-fiber -->
+**Delivering to a parked process runs its continuation on its own fiber, not on
+yours — so delivering from inside a lock the process needs is a deadlock.**
+Missionary's ports call the waiting party's callback inline: `(mbx x)` runs the
+fetching process's continuation on the posting thread, which is why in
+missionary a `locking` block around the post is re-entered by the same thread
+and survives. Ebb's port hands the value over and then, per ADR-001, *parks the
+poster until that process is quiescent again* — parked on its next task, or
+finished. The continuation is on another fiber, and a monitor the poster holds
+is not re-entrant for it.
+
+```clojure
+(def lock (Object.))
+(def mb (m/mbx))
+
+;; a consumer that needs the lock after taking
+((m/sp (let [v (m/? mb)] (locking lock (handle v)))) (fn [_]) (fn [_]))
+
+(locking lock (mb :x))     ; missionary: fine. ebb: neither side ever returns.
+```
+
+Measured: the post never returns and the consumer never runs, whether the
+poster is a plain thread or a fiber. It applies to every hand-off — `mbx`,
+`dfv`, `rdv`, `sem`, and starting or cancelling a task — because they all
+deliver the same way.
+
+The rule is the one ADR-001 states for ebb's own internals, and it holds for
+callers too: **do not invoke a task, or deliver to a port, from inside a
+critical section.** Collect what you want to send while you hold the lock, and
+send it after you have let go.
+
+```clojure
+(let [pending (locking lock (let [out (compute!)] (collect out)))]
+  (doseq [x pending] (mb x)))       ; delivered with nothing held
+```
+
 <!-- divergence: ap-cp-cost-a-hop -->
 **`ap` and `cp` cost a scheduling hop per resumption**, because a callback
 enqueues on the owner instead of resuming inline. `sp` doesn't.

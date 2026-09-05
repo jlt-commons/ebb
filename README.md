@@ -51,7 +51,7 @@ There's no release on Clojars yet.
 ## What differs from missionary
 
 The exhaustive list lives in
-[doc/conformance.md](doc/conformance.md), and three user visible
+[doc/conformance.md](doc/conformance.md), and four user visible
 differences are as follows.
 
 **`?` parks at any call depth.** Cloroutine's transform is lexical, so
@@ -65,6 +65,21 @@ matter.
 ```
 
 Missionary code keeps working here, but Ebb code may not port back.
+
+**Delivering to a parked process runs its continuation on its own fiber.**
+Missionary calls the waiting party's callback inline, on the delivering thread.
+Ebb hands the value over and parks the deliverer until that process is
+quiescent again, so the continuation runs elsewhere — and a lock you are
+holding is not re-entrant for it.
+
+```clojure
+((m/sp (let [v (m/? mb)] (locking lock (handle v)))) (fn [_]) (fn [_]))
+
+(locking lock (mb :x))     ; missionary: fine. ebb: neither side ever returns.
+```
+
+Deliver with nothing held: collect inside the critical section, send after it.
+This covers `mbx`, `dfv`, `rdv`, `sem` and task invocation alike.
 
 **`Cancelled` is a value rather than a class.** Jolt has no user-defined
 classes, so ebb throws an `ex-info`. Test it with `m/cancelled?` instead of

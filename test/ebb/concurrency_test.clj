@@ -202,3 +202,29 @@
         (let [[tag v] (deref p timeout-ms [:err ::timeout])]
           (when-not (and (= :err tag) (not= ::timeout v)) (swap! bad inc)))))
     (is (zero? @bad) "every run must report Uninitialized rather than stall")))
+
+;; ------------------------------------------------------ delivery is a hand-off
+
+(deftest delivery-does-not-run-the-consumer-inline
+  ;; Missionary's ports call the waiting party's callback on the delivering
+  ;; thread: `(mbx x)` runs the fetching process's continuation before the post
+  ;; returns, on the poster's own thread. Ebb hands the value over and parks the
+  ;; poster until that process is quiescent again (ADR-001), and the
+  ;; continuation belongs to the process's own fiber.
+  ;;
+  ;; This is what makes the caller-facing rule in doc/conformance.md true: a
+  ;; delivery from inside a lock the consumer needs deadlocks both sides, since
+  ;; a monitor the poster holds is not re-entrant for another fiber. Deliver
+  ;; with nothing held.
+  (let [mb       (m/mbx)
+        consumer (promise)]
+    ((m/sp (m/? mb) (deliver consumer (.getName (Thread/currentThread))))
+     (fn [_]) (fn [_]))
+    ;; the assertion holds whether or not the consumer has reached its park --
+    ;; a queued value is taken on its fiber too -- but this makes it the
+    ;; hand-off path the divergence is about
+    (Thread/sleep 50)
+    (let [poster (.getName (Thread/currentThread))]
+      (mb :x)
+      (is (not= poster (deref consumer timeout-ms ::timeout))
+          "the consumer's continuation must not run on the delivering thread"))))
