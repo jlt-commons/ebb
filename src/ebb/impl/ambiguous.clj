@@ -376,9 +376,12 @@
 
 (defn run [body n t]
   (let [pr (p/prompt)
-        ps (->Process n t pr (server/spawn) true [] false [] 1 [] false false)]
-    (call! ps (fn []
-                (register! pr)
-                (handle! ps nil (step! ps #(p/start pr body)))
-                (pump! ps)))
+        o  (server/owner)
+        ps (->Process n t pr o true [] false [] 1 [] false false)]
+    ;; one handshake, not two: the owner fiber runs the start-up as its first
+    ;; act rather than being spawned and then called into (ebb-8nq.40)
+    (server/start! o (fn []
+                       (register! pr)
+                       (handle! ps nil (step! ps #(p/start pr body)))
+                       (pump! ps)))
     ps))

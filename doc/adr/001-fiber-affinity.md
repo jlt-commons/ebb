@@ -321,6 +321,16 @@ on the owner fiber, resume inline" fast path until there is a benchmark
 justifying it — that path reintroduces exactly the reentrancy the discipline
 exists to prevent.
 
+The hop is dearer than a microbenchmark suggests, and knowing why matters when
+reading one. A hot owner fiber — one being hammered in a tight loop — answers a
+`call!` in about 27µs. A real one is **cold**, parked on its channel between
+messages, and waking it costs 45–55µs. So count hops, but price them cold:
+`ebb-8nq.36` concluded marshalling was negligible by multiplying a hop count by
+the hot figure, and `ebb-8nq.40` found it was about half the cost of starting an
+`ap`. What follows from that is to remove hops rather than shave them —
+`server/start!` runs a process's start-up on the owner fiber as it spawns it,
+which is one handshake where there were two.
+
 **Impl ports are not free translations.** Every shared-impl port must consult the
 Java file for its synchronisation strategy even though it derives its logic from
 the `.cljs` file. Note both sources in the provenance header.

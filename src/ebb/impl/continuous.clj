@@ -257,8 +257,10 @@
 
 (defn run [body n t]
   (let [pr (p/prompt)
-        ps (->Process n t pr body (server/spawn) true none [] #{} [] false false false)]
-    (call! ps #(register! pr))
+        o  (server/owner)
+        ps (->Process n t pr body o true none [] #{} [] false false false)]
+    ;; one handshake, not two -- see server/start! and ebb-8nq.40
+    (server/start! o #(register! pr))
     ;; A continuous flow always has a value to give, so it notifies at once and
     ;; computes nothing until downstream actually samples.
     (set! (.-notified ps) true)

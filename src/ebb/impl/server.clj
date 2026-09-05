@@ -145,17 +145,42 @@
 
 (defn owner-id [^Owner o] (.-id o))
 
-(defn spawn
-  "Start an owner fiber. Returns once it is serving."
+(defn owner
+  "Allocate an owner. Its fiber does not exist until `start!`."
   []
-  (let [o     (->Owner (atom []) (a/chan (a/sliding-buffer 1)) nil true false)
-        ready (promise)]
+  (->Owner (atom []) (a/chan (a/sliding-buffer 1)) nil true false))
+
+(defn start!
+  "Spawn o's fiber, run (f) ON IT, and return once that has happened. f may be
+  nil, in which case this is just \"start serving\".
+
+  Fusing the two is worth doing rather than tidy. Starting an ap used to cost a
+  spawn handshake AND a `call!`, and the call! is the expensive kind: the owner
+  fiber has just been created and is parked on its channel, so waking it costs
+  a cold scheduling round trip rather than the hot one a tight benchmark loop
+  measures. Instrumented on `(m/reduce conj [] (m/ap (m/?> (m/seed [1]))))`,
+  that was 41us for the spawn and another 47us for the first call!, out of 336us
+  end to end. One handshake now (ebb-8nq.40).
+
+  The caller's ambient context travels with it, and back, exactly as `call!`
+  does -- an ap started from inside a reactor propagation must see it, and
+  anything the body pushes onto `delayed` must reach the caller. ADR-001 rule 6."
+  [^Owner o f]
+  (let [ready (promise)
+        ctx   (u/capture-context)]
     (fib/spawn
       (fn []
         (let [me (p/here)]
           (set! (.-id o) me)
           (swap! inboxes assoc me o)
-          (deliver ready true)
+          (if f
+            (let [was (u/install-context! ctx)]
+              ;; f is the process's own start-up; a throw out of it has nowhere
+              ;; to go but the report, as a cast's would
+              (try (f) (catch Throwable e (u/report-uncaught! "ap/cp owner start" e)))
+              (deliver ready [(u/capture-context)])
+              (u/install-context! was))
+            (deliver ready nil))
           (loop []
             (run! serve-one! (drain! o))
             (when (.-live o)
@@ -167,8 +192,18 @@
           (set! (.-drained o) true)
           (run! serve-one! (drain! o))
           (swap! inboxes dissoc me))))
-    (deref ready)
+    ;; only a start that RAN something has a context to give back. A plain
+    ;; spawn has done no work on the caller's behalf, and installing its empty
+    ;; snapshot would clear a propagation the caller is still inside --
+    ;; reactor-double-sub catches exactly that.
+    (when-some [reply (deref ready)]
+      (u/install-context! (nth reply 0)))
     o))
+
+(defn spawn
+  "Start an owner fiber. Returns once it is serving."
+  []
+  (start! (owner) nil))
 
 (defn retire!
   "Stop the owner fiber. Later work runs inline on its caller."
