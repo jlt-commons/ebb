@@ -1,13 +1,14 @@
 # ebb
 
 A port of [missionary](https://github.com/leonoel/missionary) to
-[jolt](https://github.com/jolt-lang/jolt) — pure Clojure, no JVM, no
+[jolt](https://github.com/jolt-lang/jolt). Pure Clojure, no JVM, no
 ClojureScript, no `cloroutine`.
 
-Missionary is a functional effect system for Clojure: composable **tasks** (one
-value, eventually) and **flows** (many values, backpressured), with real
-cancellation and glitch-free dataflow propagation. Ebb is that system running on
-jolt's Chez Scheme runtime, on fibers.
+Missionary is a functional effect system for Clojure. It gives you composable
+**tasks**, which produce one value eventually, and **flows**, which produce many
+values with backpressure. Both come with real cancellation and glitch-free
+dataflow propagation. Ebb is that system running on jolt's Chez Scheme runtime,
+on fibers.
 
 ```clojure
 (require '[ebb.core :as m])
@@ -24,26 +25,18 @@ jolt's Chez Scheme runtime, on fibers.
 ;=> [1 1 2 2 3 3]
 ```
 
-**Status: feature-complete, with no known open defects.** Every public var of
-missionary's API is ported — the three process primitives (`sp`, `ap`, `cp`),
-the propagator and reactor, every port and flow operator, `via`/`blk`/`cpu`,
-and `publisher`/`subscribe`. Ebb runs **missionary's own test namespaces**,
-edited only where [doc/conformance.md](doc/conformance.md) says so. The whole
-suite is **281 tests, 1187 assertions**; 196 of those tests are missionary's,
-and the rest are ebb's own — ADR-001's concurrency cases, a stress harness for
-the flow operators, and the repros from missionary's issue tracker.
+Every public var of missionary's API is ported. That covers the three process
+primitives `sp`, `ap` and `cp`, the propagator and reactor, every port and flow
+operator, `via`/`blk`/`cpu`, and `publisher`/`subscribe`.
 
-The suite is **20 runs in 20 clean, with no hangs**. Getting there fixed
-sixteen concurrency defects and two scheduling costs, most of them found by
-measurement, by enumerating interleavings, or by running the same program
-against missionary itself rather than by reading code — the story is in
-[model/](model/README.md) and
-[doc/conformance.md](doc/conformance.md#known-defects).
+Ebb runs missionary's own test namespaces, edited only where
+[doc/conformance.md](doc/conformance.md) says so. The suite is 281 tests and
+1187 assertions, 196 of those tests coming straight from missionary.
 
 ## Install
 
-Ebb needs [jolt](https://github.com/jolt-lang/jolt) (v0.8.1 or newer) and
-nothing else — no Chez, no JVM, no C toolchain:
+Ebb needs [jolt](https://github.com/jolt-lang/jolt) v0.8.1 or newer and nothing
+else. No Chez, no JVM, no C toolchain.
 
 ```bash
 curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
@@ -56,37 +49,34 @@ Then depend on ebb as a git library, pinning a commit:
                          :git/sha "<full-sha>"}}}
 ```
 
-There is no release on Clojars yet.
+There's no release on Clojars yet.
 
 ## What differs from missionary
 
-Two differences you will actually notice; the exhaustive list is
-[doc/conformance.md](doc/conformance.md), and anything not listed there is a
-bug.
+Three differences you'll actually notice. The exhaustive list lives in
+[doc/conformance.md](doc/conformance.md), and anything missing from it is a bug.
 
-**`?` parks at any call depth.** Cloroutine's transform is lexical, so in
-missionary `?` must appear syntactically inside the `sp` body and a helper
-function cannot park. Ebb's `sp` is a fiber with a real stack:
+**`?` parks at any call depth.** Cloroutine's transform is lexical, so
+missionary needs `?` to appear syntactically inside the `sp` body and a helper
+function can't park. Ebb's `sp` is a fiber with a real stack, so depth doesn't
+matter.
 
 ```clojure
 (defn helper [ms v] (m/? (m/sleep ms v)))   ; an ordinary fn that parks
 (m/? (m/sp (inc (helper 10 5))))            ;=> 6
 ```
 
-Missionary code keeps working here; ebb code may not port back.
+Missionary code keeps working here. Ebb code may not port back.
 
-**`Cancelled` is a value, not a class.** Jolt has no user-defined classes, so
-ebb throws an `ex-info`. Test it with `m/cancelled?`, not `instance?`. This is
-the only edit most ported tests needed.
+**`Cancelled` is a value rather than a class.** Jolt has no user-defined
+classes, so ebb throws an `ex-info`. Test it with `m/cancelled?` instead of
+`instance?`. This is the only edit most ported tests needed.
 
-**Reactive Streams is a protocol, not a Java interface.** `publisher` returns
-something implementing `ebb.rs/Publisher` rather than
-`org.reactivestreams.Publisher` — same three roles, same contract, stated in
+**Reactive Streams is a protocol rather than a Java interface.** `publisher`
+returns something implementing `ebb.rs/Publisher`, not
+`org.reactivestreams.Publisher`. Same three roles and same contract, stated in
 Clojure because jolt has no Java interfaces. Missionary's own `pub_test` and
-`sub_test` run against it with only the interface names swapped.
-
-Nothing else is missing: `via`/`via-call`/`blk`/`cpu` are present too, and
-cancellation really does interrupt the evaluating thread.
+`sub_test` run against it with the interface names swapped.
 
 ## Tests
 
@@ -95,35 +85,32 @@ bin/test                    # the whole suite
 bin/test ebb.rdv-test       # one namespace
 ```
 
-Test namespaces are discovered by scanning `test/ebb/*_test.clj`, so adding a
-file is enough. `bin/port-test` and `bin/port-impl` mechanically translate more
-of missionary's sources, warning on the constructs that need a human.
+Test namespaces are found by scanning `test/ebb/*_test.clj`, so adding a file is
+enough. `bin/port-test` and `bin/port-impl` mechanically translate more of
+missionary's sources and warn on the constructs that need a human.
 
 ## Documentation
 
-- [doc/conformance.md](doc/conformance.md) — every observable difference from
-  missionary. Exhaustive by intent, following jolt's own
-  `known-divergences.edn` pattern.
-- [doc/divergences.edn](doc/divergences.edn) — the same registry, machine
-  readable. `ebb.conformance-test` checks the two against each other on every
-  `bin/test`, so neither can rot away from the other.
-- [doc/adr/001-fiber-affinity.md](doc/adr/001-fiber-affinity.md) — the design,
-  and why it is shaped this way. Six rules, each one earned by a bug.
-- [doc/evaluation.md](doc/evaluation.md) — the feasibility study the port was
-  built on, with its wrong turns corrected inline.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, test and port; the
-  conventions a change is expected to follow.
-- [model/README.md](model/README.md) — core.logic models that enumerate every
-  interleaving of the concurrency design. They found the two races behind a
-  hang that re-running the suite could not localise.
+- [doc/conformance.md](doc/conformance.md) walks through every observable
+  difference from missionary.
+- [doc/divergences.edn](doc/divergences.edn) is the same registry in machine
+  readable form. `ebb.conformance-test` checks the two against each other on
+  every `bin/test` run.
+- [doc/adr/001-fiber-affinity.md](doc/adr/001-fiber-affinity.md) is the design.
+  Six rules, and everything in `impl/` follows them.
+- [doc/evaluation.md](doc/evaluation.md) is the feasibility study the port was
+  built on.
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers building, testing and porting, plus
+  the conventions a change is expected to follow.
+- [model/README.md](model/README.md) holds core.logic models that enumerate
+  every interleaving of the concurrency design.
 
 ## Why "ebb"
 
-It suggests a natural, rhythmic flow — much like data moving through a reactive
+It suggests a natural, rhythmic flow, much like data moving through a reactive
 system. One punchy syllable, memorable, and not taken by an existing library.
 
 ## License
 
 [EPL 2.0](LICENSE), the same license as missionary and jolt. Files derived from
-missionary carry a header naming the source they came from; see
-[NOTICE](NOTICE).
+missionary carry a header naming their source. See [NOTICE](NOTICE).

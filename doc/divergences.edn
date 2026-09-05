@@ -1,49 +1,39 @@
-;; ebb's conformance registry -- the machine-readable half of doc/conformance.md.
+;; ebb's conformance registry, the machine readable half of doc/conformance.md.
 ;;
-;; doc/conformance.md is the prose. This file is what test/ebb/conformance-test
-;; can check, so the prose cannot rot away from the code (ebb-8nq.22). It follows
-;; jolt's own test/conformance/known-divergences.edn pattern: a divergence that
-;; is not listed is a bug, not a feature, and adding one is part of the change
-;; that causes it.
-;;
-;; WHAT THE GATE CHECKS, and what it cannot.
-;;
-;; It cannot detect an unlisted divergence -- that would need missionary as an
-;; oracle, and missionary needs a JVM, which is the whole thing ebb does without.
-;; (There IS an oracle available to a developer: see the recipe in ebb-8nq.38's
-;; notes. It is not something CI can depend on.) What the gate does enforce is
-;; that the registry cannot ROT:
+;; test/ebb/conformance-test checks the two against each other on every bin/test
+;; run, so the prose can't rot away from the code. It enforces four things:
 ;;
 ;;   * every :pinned-by names a test var that still exists, so a divergence
-;;     whose test is deleted or renamed fails the suite rather than going quiet;
-;;   * every :id appears in doc/conformance.md, so an entry whose prose is
-;;     deleted fails;
-;;   * every id marked in doc/conformance.md appears here, so prose cannot
-;;     describe a divergence the registry has never heard of;
-;;   * an entry with no test has to say WHY in :unpinned, which is the useful
-;;     discipline -- most of those turn out to be statements about the host or
-;;     about cost rather than about behaviour a test could catch.
+;;     whose test gets renamed or deleted fails the suite instead of going quiet
+;;   * every :id appears in doc/conformance.md, so deleting the prose fails
+;;   * every id marked in doc/conformance.md appears here, so the prose can't
+;;     describe something the registry has never heard of
+;;   * an entry with no test says why in :unpinned
+;;
+;; What it can't do is spot a divergence nobody wrote down. That needs missionary
+;; as an oracle, and missionary needs a JVM, which is the one thing ebb does
+;; without. See CONTRIBUTING.md.
 ;;
 ;; :kind is :api, :behaviour, :host, or :harness.
 
 [{:id       :cancelled-is-a-value
   :kind     :api
-  :summary  "missionary throws missionary.Cancelled; jolt has no user classes, so ebb throws an ex-info carrying ::ebb.impl.util/cancelled. Use m/cancelled?."
+  :summary  "missionary throws missionary.Cancelled. Jolt has no user classes, so ebb throws an ex-info carrying ::ebb.impl.util/cancelled. Use m/cancelled?."
   :pinned-by ebb.sp-cancel-test/body-can-catch-cancellation-and-succeed}
 
  {:id       :reactive-streams-is-a-protocol
   :kind     :api
-  :summary  "missionary's publisher returns an org.reactivestreams.Publisher; jolt has no Java interfaces, so ebb states the same three roles as protocols in ebb.rs with the same names and contract."
+  :summary  "missionary's publisher returns an org.reactivestreams.Publisher. Jolt has no Java interfaces, so ebb states the same three roles as protocols in ebb.rs with the same names and contract."
   :pinned-by ebb.pub-test/request-before-ready}
 
  {:id       :park-at-any-depth
   :kind     :behaviour
-  :summary  "cloroutine rewrites ? at the syntactic breakpoint, so missionary cannot park from a function a coroutine calls (#127, undefined upstream). An ebb sp owns a fiber and ? parks it, so depth is irrelevant. A superset."
+  :summary  "cloroutine rewrites ? at the syntactic breakpoint, so missionary cannot park from a function a coroutine calls. Undefined upstream, see #127. An ebb sp owns a fiber and ? parks it, so depth is irrelevant. A superset."
   :pinned-by ebb.missionary-issues-test/indirect-breakpoint-calls-are-legal-127}
 
  {:id       :watch-derefs-on-transfer
   :kind     :behaviour
-  :summary  "missionary #89: m/watch takes the new state from the watch callback and can discard the latest value. ebb takes the maintainer's stated fix and derefs the reference on transfer, so it reports whatever the reference holds when the consumer gets there rather than the states the callbacks carried."
+  :summary  "missionary #89. m/watch takes the new state from the watch callback and can discard the latest value. ebb takes the maintainer's stated fix and derefs the reference on transfer, so it reports whatever the reference holds when the consumer gets there rather than the states the callbacks carried."
   :pinned-by ebb.missionary-issues-test/watch-does-not-discard-the-latest-value-89}
 
  {:id       :fork-in-finally-refused
@@ -53,28 +43,28 @@
 
  {:id       :continuations-are-executor-affine
   :kind     :behaviour
-  :summary  "a continuation may only be resumed on the executor that captured it. ADR-001 discipline 2 makes that structural rather than a latent hang."
+  :summary  "a continuation may only be resumed on the executor that captured it. ADR-001 rule 2 makes that structural rather than a latent hang."
   :pinned-by ebb.prompt-test/resuming-on-another-fiber-throws}
 
  {:id       :subscribe-publisher-round-trip
   :kind     :behaviour
-  :summary  "(subscribe (publisher f)) is not supported, in ebb or in missionary: Pub calls on-next synchronously from inside request and Sub calls request from inside transfer, so wiring one into the other re-enters the notifier before the pending transfer returned."
-  :unpinned "Shared with missionary and not an ebb divergence at all; listed because a reader comparing the two will wonder. Nothing to pin -- the behaviour is that you must not do it."}
+  :summary  "(subscribe (publisher f)) is not supported, in ebb or in missionary. Pub calls on-next synchronously from inside request and Sub calls request from inside transfer, so wiring one into the other re-enters the notifier before the pending transfer returned."
+  :unpinned "Shared with missionary and not an ebb divergence at all. Listed because a reader comparing the two will wonder."}
 
  {:id       :ap-cp-cost-a-hop
   :kind     :behaviour
-  :summary  "ap and cp pay a scheduling hop per resumption: a callback cannot resume the process inline, it enqueues and the owner fiber picks it up (ADR-001 discipline 2)."
-  :unpinned "A statement about cost, not behaviour. ebb-8nq.40 carries the measurements; a test would be a benchmark, and benchmarks do not belong in the conformance gate."}
+  :summary  "ap and cp pay a scheduling hop per resumption. A callback cannot resume the process inline, so it enqueues and the owner fiber picks it up. See ADR-001 rule 2."
+  :unpinned "A statement about cost rather than behaviour. A test would be a benchmark, and benchmarks do not belong in the conformance gate."}
 
  {:id       :deftype-field-shadowing
   :kind     :host
-  :summary  "ebb prefixes a local that would share a name with a mutable deftype field with v-. A convention, not a known defect: the jolt bug it was adopted for does not reproduce on v0.8.1, and may never have existed -- see ebb-8nq.24."
-  :unpinned "There is nothing to assert. Renaming the locals back leaves the suite green, so a test would pass either way; the convention is documentation of a hazard, and ebb-8nq.24 records why it is kept."}
+  :summary  "ebb prefixes a local that would share a name with a mutable deftype field with v-. A convention rather than a known defect. The jolt bug it was adopted for does not reproduce on v0.8.1."
+  :unpinned "There is nothing to assert. Renaming the locals back leaves the suite green, so a test would pass either way. The convention documents a hazard."}
 
  {:id       :strings-are-codepoint-indexed
   :kind     :host
   :summary  "(count \"\\ud83d\\ude00\") is 1, where JVM Clojure counts UTF-16 code units."
-  :unpinned "A jolt property, inherited wholesale. Asserting it here would be testing jolt, not ebb."}
+  :unpinned "A jolt property, inherited wholesale. Asserting it here would test jolt rather than ebb."}
 
  {:id       :cas-compares-by-value
   :kind     :host
@@ -83,10 +73,10 @@
 
  {:id       :tck-timeout-is-lowest-priority
   :kind     :harness
-  :summary  "missionary's tck check! treats an event raised on the driving thread as reentrant; an ebb ap or cp answers from its owner fiber, so thread identity no longer reflects real-time ordering. ebb's check! delivers a timeout only when no real event is pending."
-  :unpinned "The harness cannot test itself. It is exercised by every tck case in ebb.core-test, and getting it wrong showed up there as flakes."}
+  :summary  "missionary's tck check! treats an event raised on the driving thread as reentrant. An ebb ap or cp answers from its owner fiber, so thread identity no longer reflects real-time ordering. ebb's check! delivers a timeout only when no real event is pending."
+  :unpinned "The harness cannot test itself. Every tck case in ebb.core-test exercises it."}
 
  {:id       :lolcat-waits-for-declared-events
   :kind     :harness
-  :summary  "lolcat's call required every event it declared to be raised before the call returned, which is only true when callbacks run inline on the caller. ebb's callbacks are cast onto an owner fiber, so a call now waits on a promise for up to *event-timeout*. Same events, same order, one instruction later."
-  :unpinned "The harness cannot test itself. Every lolcat-driven namespace exercises it; before the change nine of missionary's own ap and cp cases failed."}]
+  :summary  "lolcat's call required every event it declared to be raised before the call returned, which holds only when callbacks run inline on the caller. ebb's callbacks are cast onto an owner fiber, so a call now waits on a promise for up to *event-timeout*. Same events, same order, one instruction later."
+  :unpinned "The harness cannot test itself. Every lolcat-driven namespace exercises it."}]

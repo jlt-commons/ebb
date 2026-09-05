@@ -14,15 +14,15 @@ Two facts about jolt make that ambiguity load-bearing rather than incidental.
 
 **A continuation is bound to the fiber that captured it.** `jolt.continuations`
 is explicit: invoking a continuation captured on another fiber "transfers control
-into a stack segment this thread is not running; unguarded it HANGS the process
-with no error at all." Ebb needs re-entrant `call/cc` for `ap`/`cp`, so this is
-not a corner we can avoid. A hang with no error is the worst possible failure
-mode — it cannot be caught, logged, or bisected.
+into a stack segment this thread is not running. Unguarded it HANGS the process
+with no error at all." Ebb needs re-entrant `call/cc` for `ap` and `cp`, so this
+isn't a corner we can avoid, and a hang with no error is the worst failure mode
+there is. You can't catch it, log it or bisect it.
 
 **Jolt's carriers are a real thread pool.** Missionary ships two impl sets: the
 `.clj` ones synchronize, the `.cljs` ones assume a single thread and take no
-locks. The `.cljs` set is the right porting base — it is pure Clojure, and the
-`.clj` set is Java — but its lock-free assumption is false on jolt, where
+locks. The `.cljs` set is the right porting base, being pure Clojure where the
+`.clj` set is Java, but its lock-free assumption is false on jolt, where
 `(jolt.fibers/carrier-count)` is greater than one by default.
 
 Taking the `.cljs` logic and the `.clj` locking discipline is the correct
@@ -73,9 +73,9 @@ impossible rather than a latent hang, and gives process state exactly one writer
 so the `.cljs` lock-free logic is correct again inside a process.
 
 **The mailbox originally specified here is withdrawn: jolt already provides it.**
-Erlang and the CML lineage agree that *the waker never runs the waiter's code; it
+Erlang and the CML lineage agree that *the waker never runs the waiter's code. It
 makes it runnable and returns.* Erlang copies into the receiver's mailbox and
-enqueues the receiver on a run queue; Guile Fibers, after Concurrent ML, resumes
+enqueues the receiver on a run queue. Guile Fibers, after Concurrent ML, resumes
 with `(schedule (lambda () (k val)))` rather than calling `k` inline, arbitrating
 with an atomic W/C/S box so exactly one party commits a rendezvous. jolt's
 `alt-deliver!` (`host/chez/java/async.ss`) does precisely this -- it commits the
@@ -151,7 +151,7 @@ single owner.
 `Sequential.java`: the token holds the cancel fn of the task the process is
 parked on (`nop` while running), `kill` nulls it and invokes it, and a park
 attempted after that cancels its task immediately. Missionary holds the token
-under the process monitor; ebb's body runs on its own fiber, so the token is an
+under the process monitor. Ebb's body runs on its own fiber, so the token is an
 atom driven by CAS. Cancelling does **not** stop the body -- the pending task
 fails with `Cancelled`, that surfaces at the `?` which parked, and the body
 decides. This is missionary's model and Erlang's, and on fibers it is the only
@@ -182,7 +182,7 @@ delimiter, driven in the Guile Fibers shape -- the driver re-enters the
 continuation, the continuation never calls the driver. Two details there are
 load-bearing rather than incidental, and both are commented in the file: the
 normal return must go through the cell (re-read at return time) or every resume
-delivers to the *first* driver call; and that read must happen after the thunk
+delivers to the *first* driver call, and that read must happen after the thunk
 runs, since `(@cell [::value (thunk)])` evaluates the operator first. A dynamic
 `binding` cannot serve as the cell -- bindings survive a capture but not a
 re-entry.
@@ -200,7 +200,7 @@ Two guards, each pinned by a test that fails without it:
   thread's stack whether or not a fiber is riding it.
 - **No fork inside a `finally`.** Re-entry re-runs dynamic-wind after-thunks,
   and jolt compiles `finally` to one. Measured: `finally` runs N+1 times for N
-  branches where the answer is N. `catch` has no winder and is allowed; fiber
+  branches where the answer is N. `catch` has no winder and is allowed. Fiber
   parks are unaffected because jolt strips finally winders on a park. Detected
   by walking the winder chain for jolt's own `jolt-finally-marker`, relative to
   the depth recorded at prompt entry, so a `finally` outside the prompt does not
@@ -268,8 +268,8 @@ look right:
 
 - A **global** answers "yes, you are inside a propagation" to every fiber in the
   process. An event raised from a timer fiber while some reactor happened to be
-  propagating then took the in-context branch and read `(.-current ps)` — which
-  the propagation nils on its way out — as a null `.-ranks`.
+  propagating then took the in-context branch and read `(.-current ps)` as a
+  null `.-ranks`, since the propagation nils it on the way out.
 - **Per-fiber** is wrong in the opposite direction, and deterministically. On the
   JVM a reactor's flows run *inline on the propagating thread*, so the
   `ThreadLocal` reaches them all. In ebb an `ap` or `cp` inside a reactor runs on
@@ -277,7 +277,7 @@ look right:
   finds nothing: `Subscription failure : not in reactor context`.
 
 Neither the thread nor the fiber is the unit. What a `ThreadLocal` delimits,
-given inline execution, is the **dynamic extent of the call** — and ebb's
+given inline execution, is the **dynamic extent of the call**, and ebb's
 stand-in for that extent is the `server/call!` handshake. So state of this kind
 is a *carried local* (`ebb.impl.util/carried-local`): the caller snapshots it
 into the message, the callee installs it for exactly that thunk and restores
@@ -289,18 +289,18 @@ the caller sees on return, and the reactor depends on precisely that: `schedule`
 runs from a notifier deep inside a propagation and pushes onto `DELAYED`, while
 the *outermost* `event` is what drains it afterwards. Carry the context down but
 not back and that push is stranded on the callee's fiber, where nothing drains
-it — the reactor stops with no error at all.
+it, so the reactor stops with no error at all.
 
 What this buys is the distinction the fiber alone cannot make. The same owner
-fiber runs an `ap` both when a propagation pulled it — in the extent of the
-call, so in context — and when a timer resumed it, with no reactor call above
-it and therefore out of context. Only the call chain tells those apart, and the
+fiber runs an `ap` two ways. A propagation pulling it puts it in the extent of
+the call and therefore in context. A timer resuming it has no reactor call above
+it and is therefore out of context. Only the call chain tells those apart, and the
 JVM gets the same answer for the same reason.
 
 **A `ThreadLocal` with an initial value is two cells, not one**, and
 `Propagator.context` is the case that shows it. `withInitial(Context::new)` says
 both "this executor's own scratch Context, reused" and "the Context of the
-propagation in flight". Only the second is carried; the first is a plain
+propagation in flight". Only the second is carried. The first is a plain
 `context-local`, allocated once per executor. Carrying both would be worse than
 useless: a carried local that is never unset makes `cast!` degrade to `call!`
 forever (discipline 2), so every callback would go back to blocking. The active
@@ -310,37 +310,29 @@ cell is therefore set by `enter` and cleared by the `leave` that matches it, and
 ## Consequences
 
 **`sp` gets simpler than missionary's.** A jolt fiber parks a real stack, so `sp`
-needs no coroutine at all — no macro transform, no state machine. `?` therefore
+needs no coroutine at all, so there's no macro transform and no state machine.
+`?` therefore
 works at any call depth, lifting cloroutine's lexical restriction. The owner
 fiber *is* the process.
 
-**`ap`/`cp` pay a hop.** A callback cannot resume the process inline; it enqueues
-and the owner fiber picks it up. This costs a scheduling hop per resumption and
-is the price of not hanging. Do not optimize it away with an "if we are already
-on the owner fiber, resume inline" fast path until there is a benchmark
-justifying it — that path reintroduces exactly the reentrancy the discipline
+**`ap` and `cp` pay a hop.** A callback can't resume the process inline. It
+enqueues, and the owner fiber picks it up. That costs a scheduling hop per
+resumption, which is the price of not hanging. Don't optimize it away with an
+"if we're already on the owner fiber, resume inline" fast path until a benchmark
+justifies it, because that path reintroduces the reentrancy this discipline
 exists to prevent.
 
-The hop is dearer than a microbenchmark suggests, and knowing why matters when
-reading one. A hot owner fiber — one being hammered in a tight loop — answers a
-`call!` in about 27µs. A real one is **cold**, parked on its channel between
-messages, and waking it costs 45–55µs. So count hops, but price them cold:
-`ebb-8nq.36` concluded marshalling was negligible by multiplying a hop count by
-the hot figure, and `ebb-8nq.40` found it was about half the cost of starting an
-`ap`. What follows from that is to remove hops rather than shave them —
-`server/start!` runs a process's start-up on the owner fiber as it spawns it,
-which is one handshake where there were two.
+Price hops cold when you do measure them. A hot owner fiber, one being hammered
+in a tight loop, answers a `call!` in about 27µs. A real one sits parked on its
+channel between messages, and waking it costs 45 to 55µs. Multiplying a hop
+count by the hot figure will tell you marshalling is free when it's about half
+the cost of starting an `ap`. The move that follows is to remove hops rather
+than shave them. `server/start!` runs a process's start-up on the owner fiber as
+it spawns it, which is one handshake where there used to be two.
 
 **Impl ports are not free translations.** Every shared-impl port must consult the
 Java file for its synchronisation strategy even though it derives its logic from
 the `.cljs` file. Note both sources in the provenance header.
-
-**This was found the hard way, which is why it is written down.** The feasibility
-spike ported `Dataflow` and `Rendezvous` straight from `.cljs` with unsynchronised
-mutable fields. Each worked in isolation and under repetition; running a dfv
-handoff and an rdv handoff in the same process deadlocked, because two fibers lost
-an update to the waiter set and both sides waited forever. A silent hang, exactly
-the failure mode this ADR exists to eliminate -- and it took a bisect to find.
 
 **The `finally` hazard is separate and narrower.** Re-entering a continuation
 re-runs `dynamic-wind` after-thunks, so a `finally` whose `try` lexically
@@ -352,8 +344,8 @@ this ADR.
 ## Alternatives rejected
 
 **Pin everything to one carrier** (`set-carrier-count! 1`). Makes the `.cljs`
-assumption true globally and needs no discipline at all — but it makes ebb
-single-threaded, which forfeits the reason to run on fibers, and it is a
+assumption true globally and needs no discipline at all. It also makes ebb
+single-threaded, which forfeits the reason to run on fibers, and it's a
 process-global setting a library has no business imposing on its host.
 
 **Lock the coroutine processes too.** Uniform, but it does not solve the real
@@ -363,7 +355,7 @@ resumed from the wrong fiber. The hang remains, now harder to see.
 **Port a cloroutine-equivalent macro transform instead of using `call/cc`.**
 Sidesteps affinity entirely, since a state machine has no stack to be bound to.
 Rejected as ~500–800 lines of the hardest code in the project, reimplementing
-what Chez already does natively — and it must hand-compile `try`/`catch`/`loop`/
-`case` to be correct. Worth revisiting only if affinity proves unworkable in
-practice; the fallback is real, which is part of why the `call/cc` route is
-acceptable to try first.
+what Chez already does natively. It would also have to hand-compile `try`,
+`catch`, `loop` and `case` to be correct. Worth revisiting only if affinity
+proves unworkable in practice. The fallback being real is part of why the
+`call/cc` route is acceptable to try first.
