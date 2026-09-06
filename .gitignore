@@ -18,3 +18,8 @@
 # Agent instruction files: kept on a working copy, not published here.
 AGENTS.md
 CLAUDE.md
+
+# Generated documentation site (bb build, from a docs-engine checkout).
+# Published by CI from main; never committed, since a stale build in the
+# tree is worse than none.
+_site/
