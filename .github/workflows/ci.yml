@@ -1,0 +1,63 @@
+name: CI
+
+# ---------------------------------------------------------------------------
+# Ebb's gate is missionary's own test suite running on jolt. There is nothing
+# to build: a jolt project has no compile step, so the whole job is "install
+# jolt, run the tests".
+#
+# jolt is pinned for the same reason the rest of the jlt-commons fleet pins
+# it: a floating `latest` lets a release published overnight turn CI red on a
+# tree nobody touched. This workflow used to install with no version at all,
+# floating silently. `workflow_dispatch`'s `jolt-version` input overrides the
+# pin for a single run, which is what lets
+# https://github.com/jlt-commons/ci-builds fan this out across the org
+# against a candidate release (see that repo's README, "The pin convention").
+#
+# Moving JOLT_VERSION below is the cutover commit for a breaking jolt change.
+# Bump it and fix whatever it breaks in one reviewed commit.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      jolt-version:
+        description: "jolt version to install (blank = the pinned JOLT_VERSION below)"
+        required: false
+        default: ""
+
+env:
+  JOLT_VERSION: ${{ inputs.jolt-version || '0.8.1' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A clean suite finishes in well under a minute. About one run in ten hangs
+    # instead, spinning every carrier (ebb-8nq.23), so expect intermittent red
+    # until that is closed. A low ceiling turns the hang into a fast failure
+    # rather than a job sitting on a runner until GitHub's 6-hour default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # The prebuilt jolt binary is self-contained -- runtime, compiler and
+      # stdlib in one executable -- so there is no Chez, JVM or C toolchain to
+      # install. It lands in ~/.local/bin, which is not on PATH by default.
+      #
+      # Passed through env rather than interpolated into the script body, so
+      # the input can't be used for shell injection.
+      - name: Install jolt
+        run: |
+          set -euo pipefail
+          : "${JOLT_VERSION:?empty; the workflow-level pin did not resolve}"
+          curl --fail --retry 5 --retry-delay 5 --retry-all-errors -sL \
+            https://raw.githubusercontent.com/jolt-lang/jolt/main/install \
+            | bash -s -- --version "$JOLT_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        run: jolt --version
+
+      - name: Tests
+        run: bin/test
