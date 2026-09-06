@@ -212,8 +212,11 @@
     (if (nil? (.-notifier ps))
       (throw x) x)))
 
+;; RT/iter for the same reason latest/run uses it: `fs` here is (rest flows),
+;; so (m/sample f sampler) with no continuous inputs -- the single-flow sample,
+;; which nothing in the suite covered -- hands this an empty seq's nil.
 (defn run [c f fs n t]
-  (let [it (.iterator (seq fs))
+  (let [it (clojure.lang.RT/iter fs)
         arity (inc (count fs))
         args (object-array arity)
         owed (int-array arity)

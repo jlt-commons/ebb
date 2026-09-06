@@ -45,6 +45,16 @@
   (t/is (= [:ok [:nullary]]
           (settle (m/reduce conj [] (m/latest (fn [] :nullary)))))))
 
+(t/deftest sample-supports-a-sampler-only
+  ;; Not an upstream issue: ebb's own. `sample` splits its varargs into the
+  ;; sampler and the continuous inputs, so (m/sample f sampler) hands the impl
+  ;; an EMPTY input list -- the same nil target the zero-input latest above
+  ;; hands it, and the same NullPointerException. Nothing covered the shape,
+  ;; so it went unreported while the latest case was being filed. The result is
+  ;; (f) per sampled value, as it is with any other input count.
+  (t/is (= [:ok [[1] [2] [3]]]
+          (settle (m/reduce conj [] (m/sample vector (m/seed [1 2 3])))))))
+
 (t/deftest signal-reports-an-uninitialised-flow-125
   ;; #125: (m/signal (m/ap (m/? m/never))) leaked internal state and reported
   ;; nothing. It must fail instead.
