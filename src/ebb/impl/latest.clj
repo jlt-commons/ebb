@@ -180,8 +180,15 @@
              (step ps i))))
     (or (= p (.-pending ps)) (terminated ps i))))
 
+;; RT/iter, not (.iterator (seq fs)): `fs` is a rest arg, so a zero-input
+;; (m/latest f) -- issue #126, a well defined continuous flow whose state is
+;; always (f) -- hands this nil, and a method call on nil is a
+;; NullPointerException. It ran only because jolt through 0.8.1 answered
+;; (.iterator nil) with an empty iterator instead of refusing it
+;; (jolt-lang/jolt#867); 0.8.2 refuses it as the JVM always has. RT/iter is what
+;; clojure.core's own walkers use for exactly this and takes nil on both hosts.
 (defn run [c fs s d]
-  (let [it (.iterator (seq fs))
+  (let [it (clojure.lang.RT/iter fs)
         arity (count fs)
         ;; `step` starts NIL, as Latest.java's does. It is what says "this flow
         ;; has no value yet": `transfer` reports Uninitialized on it, and
