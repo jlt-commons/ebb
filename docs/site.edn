@@ -1,0 +1,22 @@
+;; Configuration for the documentation site, read by the jlt-commons
+;; docs-engine (https://github.com/jlt-commons/docs-engine).
+;;
+;; Build it locally from a docs-engine checkout with `bb build <this repo>`,
+;; or `bb serve <this repo>` to preview. CI builds and publishes it from
+;; .github/workflows/site.yml, which calls the shared workflow in
+;; jlt-commons/ci-builds.
+{;; :base-path is what makes this a project site rather than an org one. The
+ ;; site is served at https://jlt-commons.github.io/ebb/, so every URL the
+ ;; engine emits needs that prefix. Leave it out and the pages still render,
+ ;; but each one loads the ORGANIZATION site's stylesheet and every image
+ ;; 404s.
+ :base-path   "/ebb"
+
+ :title       "ebb"
+ :description "A functional effect and streaming system for Jolt: composable tasks and flows with real cancellation and glitch-free dataflow, running on Chez fibers. A port of missionary."}
+
+;; No :asset-dirs: this project has no images or demos to publish.
+;;
+;; No :home-template. docs/guide/index.md is a real overview page (not a
+;; symlink to README.md, which is the shorter GitHub-facing pitch), so the
+;; engine renders it as the generic homepage, TOC and all.
