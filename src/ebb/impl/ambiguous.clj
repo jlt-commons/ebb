@@ -312,16 +312,29 @@
 (defn- cancel [^Process ps]
   (when (.-live ps)
     (set! (.-live ps) false)
+    ;; THE FLOWS FIRST, THEN THE PARKS. Cancelling a park can resume its
+    ;; branch synchronously on this fiber: the branch fails at its `?` and
+    ;; pumps, and if the flow its fork draws from is still live the pump
+    ;; pulls the next value and forks again, whose park is cancelled on
+    ;; arrival, which pumps again -- and control never comes back to the
+    ;; loop below that would have cancelled the flow. Over an infinite seed
+    ;; that was a process spinning forever inside this function at full CPU
+    ;; (samizdat's supervisor stream, stopped: 88,641 iterations in the two
+    ;; seconds after its cancel, the reduce never settling); over a finite one
+    ;; it drained the whole seed before stopping. With the flows cancelled
+    ;; first the next pull terminates the choice and the pump runs dry.
+    ;; Ambiguous.java cancels its choice ring before its token for the same
+    ;; reason. Pinned by ebb.ap-cancel-seed-test.
+    (doseq [^Choice ch (.-choices ps)]
+      (when (.-live ch)
+        (set! (.-live ch) false)
+        (when-some [it (.-iterator ch)] (it))))
     ;; NOT named `parks`: a local sharing a name with a mutable field reads the
     ;; FIELD, so this snapshot came back as the [] just assigned and every
     ;; park-cancel was silently skipped. See doc/conformance.md.
     (let [v-parks (.-parks ps)]
       (set! (.-parks ps) [])
-      (doseq [c v-parks] (c)))
-    (doseq [^Choice ch (.-choices ps)]
-      (when (.-live ch)
-        (set! (.-live ch) false)
-        (when-some [it (.-iterator ch)] (it)))))
+      (doseq [c v-parks] (c))))
   nil)
 
 ;; ------------------------------------------------------------------- the body
