@@ -201,6 +201,16 @@
   ;; core.async/timeout rides on. No cancel: a fired-but-disarmed entry is a nop.
   (scheme/proc "jolt-timer-at!"))
 
+(def ^:private deadline
+  ;; The deadline ms from now, on the clock the timer reads. jolt 0.8.21 moved
+  ;; every runtime deadline to the monotonic clock (jolt f5fc8c6f) and added
+  ;; mono-deadline as the one way to build one; an epoch-millis deadline there
+  ;; lands decades out and the sleep never fires. Older runtimes have no
+  ;; mono-deadline and still read epoch millis.
+  (if-let [mono (try (scheme/proc "mono-deadline") (catch Throwable _ nil))]
+    (fn [ms] (mono ms))
+    (fn [ms] (+ (System/currentTimeMillis) ms))))
+
 (defn schedule!
   "Run (f) approximately ms from now, ON ITS OWN FIBER. Returns nil; disarm with
   your own flag.
@@ -223,7 +233,7 @@
   ;; fiber-execute, not fibers/spawn: this is fire-and-forget, and spawn also
   ;; builds a handle and completion machinery nobody reads. It is on the hot
   ;; path -- every sleep in the system lands here.
-  (timer-at! (+ (System/currentTimeMillis) ms)
+  (timer-at! (deadline ms)
              (fn [] (a/fiber-execute
                       (fn [] (try (f) (catch Throwable e (report-uncaught! "timer callback" e)))))
                nil))
