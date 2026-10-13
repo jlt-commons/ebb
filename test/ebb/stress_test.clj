@@ -313,10 +313,13 @@
   ;; Asserted directly rather than through its consequences: the input counts
   ;; how many derefs are inside it at once. A consequence-based test would be
   ;; hunting a rare corruption; this one saw 2630 overlaps in 20 runs.
+  ;;
+  ;; The depth is counted per input. Shared across the four runs below, it
+  ;; also counted a cancelled run's last drain, still inside its own input's
+  ;; deref, against the next run's input -- two inputs, not one deref'd twice.
   (let [overlaps (atom 0)
-        depth    (atom 0)
         input    (fn [n t]
-                   (let [live (atom true) v (atom 0)]
+                   (let [live (atom true) v (atom 0) depth (atom 0)]
                      (n)
                      ;; a bounded rate, not a spin: hammering the notifier
                      ;; starves the carrier pool and the rest of the suite
@@ -324,7 +327,11 @@
                      (doto (Thread. (fn [] (loop []
                                              (when @live
                                                (Thread/sleep 0 100000)
-                                               (swap! v inc) (n) (recur)))))
+                                               (swap! v inc)
+                                               ;; not after the terminator: a flow
+                                               ;; that has terminated is silent
+                                               (when @live (n))
+                                               (recur)))))
                        (.setDaemon true) (.start))
                      (reify
                        ;; a cancelled flow must terminate, or sample's `alive`
