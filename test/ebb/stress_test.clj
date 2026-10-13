@@ -352,3 +352,82 @@
          (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
         (is (= :ok (first (deref out timeout-ms [:err ::timeout]))))))
     (is (zero? @overlaps) "a sampled input is never deref'd by two parties at once")))
+
+;; A transfer of `sample` takes each notified input once, plus once more for
+;; every notification that input raises from INSIDE that read -- Sample.java's
+;; do/while. A notification raised by anyone else while the read is in flight
+;; belongs to the next transfer: on the JVM its notifier is blocked on the
+;; process monitor until this transfer is over, and then it just marks the slot.
+;;
+;; Ebb reads outside any lock, so that notifier is not blocked, and sample used
+;; to count it as the read's own and read again. An input that moves on while it
+;; is being read -- the common case for a continuous input fed from another
+;; thread faster than it is sampled -- then kept one transfer reading forever.
+;; With the notifier and the read at about the same rate the loop ends at a
+;; random point, so the stress test above passed or timed out by luck.
+
+(defn- moved-on
+  "An input that is notified again from another thread during every read, and
+  waits (up to 20ms) for that notification to land before returning. One
+  notification per transfer, so within the flow protocol. `stop` silences it."
+  [reads stop]
+  (fn [n t]
+    (let [live (atom true) v (atom 0)]
+      (n)
+      (reify
+        clojure.lang.IFn
+        (invoke [_] (when (compare-and-set! live true false) (t)) nil)
+        clojure.lang.IDeref
+        (deref [_]
+          (swap! reads inc)
+          (let [x (swap! v inc) landed (promise)]
+            (doto (Thread. (fn [] (when (and @live (not @stop)) (n)) (deliver landed true)))
+              (.setDaemon true) (.start))
+            (deref landed 20 nil)
+            x))))))
+
+(deftest sample-leaves-an-outside-notification-for-the-next-transfer
+  (let [reads (atom 0) stop (atom false) out (promise)]
+    ((m/reduce conj [] (m/sample vector (moved-on reads stop) (offloaded (range 12))))
+     (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
+    (let [[tag v] (deref out timeout-ms [:err ::timeout])]
+      (reset! stop true)
+      (is (= [:ok 12] [tag (when (= :ok tag) (count v))]))
+      ;; one read per sample, plus the cancelled input's last drain
+      (is (<= @reads 13) (str @reads " reads for 12 samples")))))
+
+(deftest sample-makes-an-outside-notifier-discard-its-own-surplus
+  ;; An input that notifies without waiting to be transferred is notified while
+  ;; still notified, and Sample.java's `dirty` discards that surplus on the
+  ;; notifier's own thread, under the monitor: a notifier faster than the input
+  ;; can be read is slowed to the read's pace. Ebb used to hand every surplus to
+  ;; whoever held the slot, so a transfer holding it paid for each notification
+  ;; raised while it paid for the last, and never finished.
+  ;;
+  ;; This input's reads wait for two more notifications to land (or 20ms), so
+  ;; the notifier always outruns them.
+  (let [stop (atom false) out (promise)
+        input (fn [n t]
+                (let [live (atom true) notes (atom 0)]
+                  (n)
+                  (doto (Thread. (fn [] (loop []
+                                          (when (and @live (not @stop))
+                                            (swap! notes inc)
+                                            (n)
+                                            (Thread/yield)
+                                            (recur)))))
+                    (.setDaemon true) (.start))
+                  (reify
+                    clojure.lang.IFn
+                    (invoke [_] (when (compare-and-set! live true false) (t)) nil)
+                    clojure.lang.IDeref
+                    (deref [_]
+                      (let [from @notes end (+ (System/nanoTime) 20000000)]
+                        (while (and (< @notes (+ from 2)) (< (System/nanoTime) end))
+                          (Thread/yield))
+                        from)))))]
+    ((m/reduce conj [] (m/sample vector input (offloaded (range 12))))
+     (fn [v] (deliver out [:ok v])) (fn [e] (deliver out [:err e])))
+    (let [[tag v] (deref out timeout-ms [:err ::timeout])]
+      (reset! stop true)
+      (is (= [:ok 12] [tag (when (= :ok tag) (count v))])))))
