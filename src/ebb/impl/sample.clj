@@ -62,7 +62,7 @@
 
 (deftype Process [^:unsynchronized-mutable combinator
                   ^:unsynchronized-mutable notifier
-                  terminator args owed busy gates sampling late inputs state
+                  terminator args owed busy gates sampling late wanted inputs state
                   ^:unsynchronized-mutable done
                   alive]
   clojure.lang.IFn
@@ -88,8 +88,14 @@
   "Take slot i's deref rights. Answers [n nil] when we now hold it and it owes n
   DISCARDS, or [nil gate] when somebody else holds it -- gate opens when they
   are done. The gate is chosen under the same lock as the claim it lost, so it
-  can never be one the holder has already opened."
-  [^Process p i]
+  can never be one the holder has already opened.
+
+  A transfer asks with `want?`, and the holder then hands the slot straight to
+  it, opening the gate with :yours. Otherwise an outside notifier that drains
+  its own surplus and notifies again at once retakes the slot every time it is
+  let go, ahead of a transfer still waking up from the gate, and the transfer
+  never gets in -- which a 2-core runner showed."
+  [^Process p i want?]
   (locking p
     (let [busy (.-busy p)]
       (if (zero? (aget busy i))
@@ -98,6 +104,7 @@
           (aset owed i 0)
           [n nil])
         (let [gates (.-gates p)]
+          (when want? (aset (.-wanted p) i 1))
           [nil (or (aget gates i) (aset gates i (promise)))])))))
 
 (defn- release-slot!
@@ -108,9 +115,11 @@
     (let [owed (.-owed p) n (aget owed i)]
       (if (pos? n)
         (do (aset owed i 0) n)
-        (let [gates (.-gates p) g (aget gates i)]
-          (aset (.-busy p) i 0)
-          (when g (aset gates i nil) (deliver g true))
+        (let [gates (.-gates p) g (aget gates i)
+              wanted (.-wanted p) yours? (pos? (aget wanted i))]
+          ;; a waiting transfer takes the slot over as it stands: busy stays set
+          (if yours? (aset wanted i 0) (aset (.-busy p) i 0))
+          (when g (aset gates i nil) (deliver g (if yours? :yours true)))
           0)))))
 
 (defn- discard!
@@ -158,7 +167,7 @@
                      :else (do (aset args i args) false)))]
     (when surplus?
       (loop []
-        (let [[n gate] (take-slot! p i)]
+        (let [[n gate] (take-slot! p i false)]
           (if (some? n)
             (discard! p i n)
             (when (and wait? (not own?))
@@ -202,10 +211,14 @@
   [^Process ps i]
   (let [args  (.-args ps)
         input (aget (.-inputs ps) i)]
-    (loop []
-      (let [[n gate] (take-slot! ps i)]
-        (if (nil? n)
-          (do (deref gate 1000 nil) (recur))
+    (let [n (loop []
+              (let [[n gate] (take-slot! ps i true)]
+                (cond
+                  (some? n) n
+                  ;; handed over, owing nothing: the holder drained it all
+                  (= :yours (loop [] (let [r (deref gate 1000 ::wait)]
+                                       (if (= ::wait r) (recur) r)))) 0
+                  :else (recur))))]
           (try
             ;; the discards this slot is owed come first, and are dropped
             (dotimes [_ n] (try (read! ps i input) (catch Throwable _ nil)))
@@ -248,7 +261,7 @@
                 (let [m (release-slot! ps i)]
                   (when (pos? m)
                     (dotimes [_ m] (try (read! ps i input) (catch Throwable _ nil)))
-                    (recur)))))))))))
+                    (recur)))))))))
 
 (defn transfer [^Process ps]
   (let [c       (.-combinator ps)
@@ -288,11 +301,12 @@
         gates (object-array arity)
         sampling (int-array arity)
         late (int-array arity)
+        wanted (int-array arity)
         inputs (object-array arity)
         ;; the claim starts held: Sample.java holds the monitor across the whole
         ;; of this construction, and the sampler's notifier must not run a round
         ;; against an `inputs` array that is not filled in yet.
-        ps (->Process c n t args owed busy gates sampling late inputs (arb/arbiter) false (atom arity))
+        ps (->Process c n t args owed busy gates sampling late wanted inputs (arb/arbiter) false (atom arity))
         done #(when (zero? (swap! (.-alive ps) dec))
                 ((.-terminator ps)))]
     (loop [index 0 flow f]
