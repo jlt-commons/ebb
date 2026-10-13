@@ -32,10 +32,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A clean suite finishes in well under a minute. About one run in ten hangs
-    # instead, spinning every carrier (ebb-8nq.23), so expect intermittent red
-    # until that is closed. A low ceiling turns the hang into a fast failure
-    # rather than a job sitting on a runner until GitHub's 6-hour default.
+    # A clean suite finishes in well under a minute. A low ceiling turns a hang
+    # into a fast failure rather than a job sitting on a runner until GitHub's
+    # 6-hour default.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
