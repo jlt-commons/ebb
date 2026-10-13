@@ -5,16 +5,15 @@ name: CI
 # to build: a jolt project has no compile step, so the whole job is "install
 # jolt, run the tests".
 #
-# jolt is pinned for the same reason the rest of the jlt-commons fleet pins
-# it: a floating `latest` lets a release published overnight turn CI red on a
-# tree nobody touched. This workflow used to install with no version at all,
-# floating silently. `workflow_dispatch`'s `jolt-version` input overrides the
-# pin for a single run, which is what lets
-# https://github.com/jlt-commons/ci-builds fan this out across the org
-# against a candidate release (see that repo's README, "The pin convention").
-#
-# Moving JOLT_VERSION below is the cutover commit for a breaking jolt change.
-# Bump it and fix whatever it breaks in one reviewed commit.
+# jolt tracks the nightly build (release tag vnightly, the rolling build of
+# jolt's main), so a jolt change that breaks ebb shows up the day it lands.
+# The 0.8.2 pin this replaced missed jolt 0.8.21 moving the runtime's timer
+# onto the monotonic clock, which left every ebb sleep and timeout armed for
+# decades until v0.1.4 fixed it. The cost is that an overnight jolt commit
+# can turn CI red on a tree nobody touched; that red is the point.
+# `workflow_dispatch`'s `jolt-version` input still overrides it for a single
+# run, which is what lets https://github.com/jlt-commons/ci-builds fan this
+# out across the org against a candidate release.
 # ---------------------------------------------------------------------------
 
 on:
@@ -23,20 +22,19 @@ on:
   workflow_dispatch:
     inputs:
       jolt-version:
-        description: "jolt version to install (blank = the pinned JOLT_VERSION below)"
+        description: "jolt version to install (blank = nightly)"
         required: false
         default: ""
 
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || '0.8.2' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || 'nightly' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A clean suite finishes in well under a minute. About one run in ten hangs
-    # instead, spinning every carrier (ebb-8nq.23), so expect intermittent red
-    # until that is closed. A low ceiling turns the hang into a fast failure
-    # rather than a job sitting on a runner until GitHub's 6-hour default.
+    # A clean suite finishes in well under a minute. A low ceiling turns a hang
+    # into a fast failure rather than a job sitting on a runner until GitHub's
+    # 6-hour default.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
