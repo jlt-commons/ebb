@@ -28,7 +28,7 @@ on:
         default: ""
 
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || '0.8.2' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || '0.8.24' }}
 
 jobs:
   test:
