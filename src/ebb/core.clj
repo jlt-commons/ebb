@@ -7,7 +7,7 @@
 
   Where missionary needs cloroutine to fake a resumable stack on the JVM, jolt
   parks a real one: `?` works from any function, not only lexically inside `sp`."
-  (:refer-clojure :exclude [reduce])
+  (:refer-clojure :exclude [eduction group-by reduce reductions])
   (:require [ebb.impl.util :as u]
             [ebb.impl.dataflow :as dataflow]
             [ebb.impl.rendezvous :as rendezvous]
